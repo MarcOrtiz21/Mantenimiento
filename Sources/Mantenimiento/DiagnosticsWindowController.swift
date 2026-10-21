@@ -2859,13 +2859,15 @@ private struct SparklineChartView: View {
     var footnote: String? = nil
 
     private var domain: ClosedRange<Double> {
-        let values = points.points.map(\.value)
+        let values = points.points.map(\.value).filter(\.isFinite)
         guard let minValue = values.min(), let maxValue = values.max() else {
             return 0...1
         }
 
-        let padding = max((maxValue - minValue) * 0.18, max(abs(maxValue) * 0.08, 1))
-        return max(0, minValue - padding)...(maxValue + padding)
+        let padding = max((maxValue - minValue) * 0.18, max(max(abs(maxValue), abs(minValue)) * 0.08, 1))
+        let lower = minValue >= 0 ? max(0, minValue - padding) : minValue - padding
+        let upper = maxValue <= 0 && minValue < 0 ? min(0, maxValue + padding) : maxValue + padding
+        return lower...max(upper, lower + 1)
     }
 
     var body: some View {
