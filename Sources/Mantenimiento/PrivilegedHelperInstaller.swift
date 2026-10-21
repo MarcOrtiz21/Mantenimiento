@@ -1,5 +1,8 @@
 import Darwin
 import Foundation
+import CryptoKit
+import Security
+import MantenimientoCore
 
 enum PrivilegedHelperInstaller {
     static let label = "local.marc.mantenimiento.helper"
@@ -18,7 +21,24 @@ enum PrivilegedHelperInstaller {
     }
 
     static func isConnected() -> Bool {
-        ping() != nil
+        ping() == FanHelperProtocol.greeting && installedHelperMatchesBundle()
+    }
+
+    static func installedHelperMatchesBundle() -> Bool {
+        guard let bundled = executableCodeHash(at: bundledHelperURL),
+              let installed = executableCodeHash(at: URL(fileURLWithPath: helperDestination)) else { return false }
+        return bundled == installed
+    }
+
+    static func executableCodeHash(at url: URL) -> Data? {
+        var code: SecStaticCode?
+        var information: CFDictionary?
+        guard SecStaticCodeCreateWithPath(url as CFURL, [], &code) == errSecSuccess, let code,
+              SecStaticCodeCheckValidity(code, SecCSFlags(rawValue: kSecCSStrictValidate), nil) == errSecSuccess,
+              SecCodeCopySigningInformation(code, SecCSFlags(rawValue: kSecCSSigningInformation), &information) == errSecSuccess,
+              let info = information as? [String: Any] else { return nil }
+        // El CDHash identifica código y requisitos, no la fecha del sobre CMS.
+        return info[kSecCodeInfoUnique as String] as? Data
     }
 
     static func install() throws {
@@ -26,8 +46,6 @@ enum PrivilegedHelperInstaller {
         guard FileManager.default.isExecutableFile(atPath: helperURL.path) else {
             throw PrivilegedHelperInstallerError.missingBundle
         }
-
-        try verifySignature(at: helperURL)
 
         let appURL = Bundle.main.bundleURL
         guard let executableURL = Bundle.main.executableURL else {
@@ -39,68 +57,52 @@ enum PrivilegedHelperInstaller {
         }
 
         let identifier = Bundle.main.bundleIdentifier ?? "local.marc.mantenimiento"
+        let requirement = "identifier \"\(label)\" and certificate leaf = H\"\(certificateSHA1)\""
+        try verifySignature(at: helperURL, requirement: requirement)
         let ownerUID = getuid()
-        let plistURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("mantenimiento-helper-\(UUID().uuidString).plist")
-        let plist = """
-        <?xml version="1.0" encoding="UTF-8"?>
-        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-        <plist version="1.0">
-        <dict>
-            <key>Label</key>
-            <string>\(label)</string>
-            <key>ProgramArguments</key>
-            <array>
-                <string>\(helperDestination)</string>
-                <string>--socket</string>
-                <string>\(socketPath)</string>
-                <string>--owner-uid</string>
-                <string>\(ownerUID)</string>
-                <string>--client-path</string>
-                <string>\(executableURL.path)</string>
-                <string>--client-identifier</string>
-                <string>\(identifier)</string>
-                <string>--client-cert-sha1</string>
-                <string>\(certificateSHA1)</string>
-            </array>
-            <key>RunAtLoad</key>
-            <true/>
-            <key>KeepAlive</key>
-            <true/>
-            <key>StandardOutPath</key>
-            <string>/var/log/mantenimiento-helper.log</string>
-            <key>StandardErrorPath</key>
-            <string>/var/log/mantenimiento-helper.err</string>
-        </dict>
-        </plist>
-        """
-        try plist.write(to: plistURL, atomically: true, encoding: .utf8)
-        defer { try? FileManager.default.removeItem(at: plistURL) }
-
+        let plist: [String: Any] = [
+            "Label": label,
+            "ProgramArguments": [helperDestination, "--socket", socketPath, "--owner-uid", String(ownerUID),
+                                 "--client-path", executableURL.path, "--client-identifier", identifier,
+                                 "--client-cert-sha1", certificateSHA1],
+            "RunAtLoad": true, "KeepAlive": true,
+            "StandardOutPath": "/var/log/mantenimiento-helper.log",
+            "StandardErrorPath": "/var/log/mantenimiento-helper.err"
+        ]
+        let encodedPlist = try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
+            .base64EncodedString()
         let script = """
         set -euo pipefail
-        mkdir -p /Library/PrivilegedHelperTools
-        cp \(shellQuoted(helperURL.path)) \(shellQuoted(helperDestination))
-        chown root:wheel \(shellQuoted(helperDestination))
-        chmod 755 \(shellQuoted(helperDestination))
-        cp \(shellQuoted(plistURL.path)) \(shellQuoted(plistDestination))
-        chown root:wheel \(shellQuoted(plistDestination))
-        chmod 644 \(shellQuoted(plistDestination))
-        launchctl bootout system/\(label) 2>/dev/null || true
-        launchctl bootout system \(shellQuoted(plistDestination)) 2>/dev/null || true
-        launchctl bootstrap system \(shellQuoted(plistDestination))
-        launchctl enable system/\(label)
-        launchctl kickstart -k system/\(label)
+        umask 077
+        /usr/bin/install -d -o root -g wheel -m 755 /Library/PrivilegedHelperTools
+        stage=$(/usr/bin/mktemp -d /Library/PrivilegedHelperTools/.mantenimiento-install.XXXXXX)
+        trap '/bin/rm -rf "$stage"' EXIT
+        /bin/cp \(shellQuoted(helperURL.path)) "$stage/helper"
+        /usr/bin/codesign --verify --strict -R \(shellQuoted("=" + requirement)) "$stage/helper"
+        printf '%s' \(shellQuoted(encodedPlist)) | /usr/bin/base64 -D > "$stage/helper.plist"
+        /usr/bin/plutil -lint "$stage/helper.plist"
+        /usr/sbin/chown root:wheel "$stage/helper" "$stage/helper.plist"
+        /bin/chmod 755 "$stage/helper"
+        /bin/chmod 644 "$stage/helper.plist"
+        /bin/launchctl bootout system/\(label) 2>/dev/null || true
+        /bin/mv -f "$stage/helper" \(shellQuoted(helperDestination))
+        /bin/mv -f "$stage/helper.plist" \(shellQuoted(plistDestination))
+        /bin/launchctl bootstrap system \(shellQuoted(plistDestination))
+        /bin/launchctl enable system/\(label)
+        /bin/launchctl kickstart -k system/\(label)
         """
         try runPrivileged(script)
     }
 
     static func uninstall() throws {
+        if FileManager.default.fileExists(atPath: "/var/run/local.marc.mantenimiento.helper.manual") {
+            _ = try PrivilegedFanTool.setAllFansAuto()
+        }
         let script = """
         set -euo pipefail
-        launchctl bootout system/\(label) 2>/dev/null || true
-        launchctl bootout system \(shellQuoted(plistDestination)) 2>/dev/null || true
-        rm -f \(shellQuoted(plistDestination)) \(shellQuoted(helperDestination)) \(shellQuoted(socketPath))
+        /bin/launchctl bootout system/\(label) 2>/dev/null || true
+        /bin/launchctl bootout system \(shellQuoted(plistDestination)) 2>/dev/null || true
+        /bin/rm -f \(shellQuoted(plistDestination)) \(shellQuoted(helperDestination)) \(shellQuoted(socketPath))
         """
         try runPrivileged(script)
     }
@@ -115,46 +117,32 @@ enum PrivilegedHelperInstaller {
         return isConnected()
     }
 
-    private static func verifySignature(at url: URL) throws {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
-        process.arguments = ["--verify", "--strict", url.path]
-        process.standardOutput = Pipe()
-        process.standardError = Pipe()
-        try process.run()
-        process.waitUntilExit()
-        guard process.terminationStatus == 0 else {
+    private static func verifySignature(at url: URL, requirement text: String) throws {
+        var code: SecStaticCode?
+        var requirement: SecRequirement?
+        guard SecStaticCodeCreateWithPath(url as CFURL, [], &code) == errSecSuccess,
+              let code,
+              SecRequirementCreateWithString(text as CFString, [], &requirement) == errSecSuccess,
+              let requirement,
+              SecStaticCodeCheckValidity(code, [], requirement) == errSecSuccess else {
             throw PrivilegedHelperInstallerError.unsigned
         }
     }
 
     private static func leafCertificateSHA1(for url: URL) -> String? {
-        let process = Process()
-        let output = Pipe()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/codesign")
-        process.arguments = ["-d", "-r-", url.path]
-        process.standardOutput = output
-        process.standardError = output
-        try? process.run()
-        process.waitUntilExit()
-
-        let data = output.fileHandleForReading.readDataToEndOfFile()
-        let text = String(data: data, encoding: .utf8) ?? ""
-        guard let regex = try? NSRegularExpression(pattern: #"certificate leaf = H\"([0-9A-Fa-f]+)\""#),
-              let match = regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
-              let range = Range(match.range(at: 1), in: text) else {
-            return nil
-        }
-        return String(text[range])
+        var code: SecStaticCode?
+        var information: CFDictionary?
+        guard SecStaticCodeCreateWithPath(url as CFURL, [], &code) == errSecSuccess, let code,
+              SecCodeCopySigningInformation(code, SecCSFlags(rawValue: kSecCSSigningInformation), &information) == errSecSuccess,
+              let info = information as? [String: Any],
+              let certificates = info[kSecCodeInfoCertificates as String] as? [SecCertificate],
+              let certificate = certificates.first else { return nil }
+        return Insecure.SHA1.hash(data: SecCertificateCopyData(certificate) as Data)
+            .map { String(format: "%02x", $0) }.joined()
     }
 
     private static func runPrivileged(_ script: String) throws {
-        let scriptURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("mantenimiento-helper-\(UUID().uuidString).sh")
-        try script.write(to: scriptURL, atomically: true, encoding: .utf8)
-        defer { try? FileManager.default.removeItem(at: scriptURL) }
-
-        let command = "bash \(shellQuoted(scriptURL.path))"
+        let command = "/usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin /bin/bash -c \(shellQuoted(script))"
         let appleScript = "do shell script \(appleScriptString(command)) with administrator privileges"
         let process = Process()
         let stdout = Pipe()

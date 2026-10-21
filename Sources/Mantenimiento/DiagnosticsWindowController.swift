@@ -16,6 +16,8 @@ final class DiagnosticsWindowController: NSWindowController {
         window.minSize = NSSize(width: 680, height: 480)
         window.isReleasedWhenClosed = false
         window.center()
+        window.setFrameUsingName("Mantenimiento.Diagnostics")
+        window.setFrameAutosaveName("Mantenimiento.Diagnostics")
 
         super.init(window: window)
     }
@@ -40,7 +42,22 @@ private struct DiagnosticsRootView: View {
     @State private var topCPUDemand: MenuDemandEntry?
     @State private var isRefreshingTopDemand = false
     @State private var helperAvailable: Bool?
+    @State private var helperStatusText = "Comprobando..."
     @State private var lastTelemetryDate: Date?
+    @State private var historyRange: TelemetryHistoryRange = .live
+    @State private var historyRows: [TelemetryHistoryRow] = []
+    @State private var isLoadingHistory = false
+    @State private var wifiDetails: WiFiDetails?
+    @State private var routeDetails: NetworkRouteDetails?
+    @State private var connectivity: ConnectivityDetails?
+    @State private var storageDetails: [String: StorageDeviceDetails] = [:]
+    @State private var hardwareDetails: HardwareDetails?
+    @State private var securityDetails: SecurityDetails?
+    @State private var osDetails = SystemDetailsProvider.shared.operatingSystemDetails()
+    @State private var events: [MaintenanceEvent] = []
+    @State private var lastLatencyCheck: Date?
+    @State private var appNetworkUsage: [AppNetworkUsage] = []
+    @State private var isSamplingAppNetwork = false
 
     var body: some View {
         ZStack {
@@ -48,7 +65,7 @@ private struct DiagnosticsRootView: View {
                 .ignoresSafeArea()
 
             HStack(spacing: 0) {
-                SidebarView(selection: $selectedSection)
+                SidebarView(selection: $selectedSection, battery: snapshot.telemetry.battery)
                     .frame(width: 168)
                     .padding(.vertical, 16)
                     .padding(.leading, 12)
@@ -61,6 +78,21 @@ private struct DiagnosticsRootView: View {
 
                     ScrollView {
                         VStack(spacing: 14) {
+                            if !snapshot.sensorStatus.isCurrent || !snapshot.fanStatus.isCurrent || !snapshot.telemetry.memory.isAvailable {
+                                VStack(alignment: .leading, spacing: 6) {
+                                    if !snapshot.sensorStatus.isCurrent {
+                                        HealthStatusRow(title: "Sensores", value: snapshot.sensorStatus.description, isHealthy: false)
+                                            .help(snapshot.sensorStatus.error ?? "")
+                                    }
+                                    if !snapshot.fanStatus.isCurrent {
+                                        HealthStatusRow(title: "Ventiladores", value: snapshot.fanStatus.description, isHealthy: false)
+                                            .help(snapshot.fanStatus.error ?? "")
+                                    }
+                                    if !snapshot.telemetry.memory.isAvailable {
+                                        HealthStatusRow(title: "Memoria", value: "Sin lectura fiable", isHealthy: false)
+                                    }
+                                }
+                            }
                             selectedContent
                         }
                         .padding(.bottom, 10)
@@ -78,13 +110,45 @@ private struct DiagnosticsRootView: View {
         .onAppear {
             refreshPermissionState()
             if history.samples.isEmpty {
-                reloadSnapshot(status: nil, includeSMC: true, fullTelemetry: true, force: true)
+                if let shared = TelemetryStore.shared.latest {
+                    applySnapshot(DashboardSnapshot.make(shared: shared))
+                } else {
+                    reloadSnapshot(status: nil, includeSMC: true, fullTelemetry: true)
+                }
             }
             refreshTopCPUDemand(force: true)
             refreshHealthStatus()
+            refreshSectionDetails(selectedSection, force: true)
         }
-        .task {
-            await refreshLoop()
+        .onReceive(NotificationCenter.default.publisher(for: .telemetryUpdated)) { notification in
+            guard isDiagnosticsWindowVisible,
+                  let shared = notification.object as? SharedTelemetrySnapshot else { return }
+            applySnapshot(DashboardSnapshot.make(shared: shared))
+            refreshSequence += 1
+            if refreshSequence.isMultiple(of: 3) {
+                refreshGPUDemand()
+                refreshTopCPUDemand()
+                refreshSectionDetails(selectedSection)
+            }
+            if selectedSection == .cleaning || selectedSection == .system {
+                refreshPermissionState()
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .maintenanceEventLogged)) { _ in
+            if selectedSection == .activity {
+                refreshEvents()
+            }
+        }
+        .onChange(of: historyRange) { _ in
+            loadHistory()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { notification in
+            guard let window = notification.object as? NSWindow,
+                  window.title == "Mantenimiento" else { return }
+            if let shared = TelemetryStore.shared.latest {
+                applySnapshot(DashboardSnapshot.make(shared: shared))
+            }
+            refresh()
         }
         .onChange(of: selectedSection) { section in
             if section == .gpu {
@@ -99,6 +163,7 @@ private struct DiagnosticsRootView: View {
             if section == .system {
                 refreshHealthStatus()
             }
+            refreshSectionDetails(section, force: true)
         }
         .onReceive(NotificationCenter.default.publisher(for: .diagnosticsSectionRequested)) { notification in
             guard let rawValue = notification.userInfo?["section"] as? String,
@@ -132,7 +197,8 @@ private struct DiagnosticsRootView: View {
         case .gpu:
             gpuSection
         case .memory:
-            memorySection
+            if snapshot.telemetry.memory.isAvailable { memorySection }
+            else { EmptyStateView(message: "No hay una lectura de memoria fiable.") }
         case .network:
             networkSection
         case .storage:
@@ -145,6 +211,8 @@ private struct DiagnosticsRootView: View {
             temperatureSection
         case .energy:
             powerSection
+        case .activity:
+            activitySection
         case .system:
             systemSection
         }
@@ -210,21 +278,16 @@ private struct DiagnosticsRootView: View {
                 MetricView(
                     title: "GPU",
                     value: history.latestGPUUsage.map(formatPercent) ?? "sin datos",
-                    symbol: "gpu",
+                    symbol: "square.stack.3d.up.fill",
                     tint: .accentColor
                 )
                 MetricView(
                     title: "Memoria",
-                    value: formatPercent(snapshot.telemetry.memory.usedRatio),
+                    value: snapshot.telemetry.memory.isAvailable ? formatPercent(snapshot.telemetry.memory.usedRatio) : "--",
                     symbol: "memorychip",
                     tint: snapshot.telemetry.memory.pressureLevel >= 2 ? .orange : .secondary
                 )
-                MetricView(
-                    title: "Red",
-                    value: "↓ \(history.latestNetworkDownBps.map(formatRate) ?? "--")  ↑ \(history.latestNetworkUpBps.map(formatRate) ?? "--")",
-                    symbol: "network",
-                    tint: .accentColor
-                )
+                NetworkMetricView(up: history.latestNetworkUpBps, down: history.latestNetworkDownBps)
                 MetricView(
                     title: "Temp. máx.",
                     value: snapshot.sensors?.hottestTemperature.map { formatTemperature($0.value) } ?? "sin datos",
@@ -232,14 +295,12 @@ private struct DiagnosticsRootView: View {
                     tint: snapshot.system.thermalTint
                 )
                 if let battery = snapshot.telemetry.battery {
-                    MetricView(
-                        title: "Batería",
-                        value: "\(battery.percent)%",
-                        symbol: "battery.100percent",
-                        tint: battery.isCharging || battery.isCharged ? .green : .secondary
-                    )
+                    BatteryMetricView(battery: battery)
+                        .onTapGesture { selectedSection = .energy }
                 }
             }
+
+            MaintenanceReviewPanel(items: maintenanceReviewItems)
 
             SectionPanel(title: "Mayor carga", symbol: "speedometer") {
                 if isRefreshingTopDemand && topCPUDemand == nil {
@@ -260,98 +321,182 @@ private struct DiagnosticsRootView: View {
         }
     }
 
+    private var maintenanceReviewItems: [MaintenanceReviewItem] {
+        MaintenanceReview.items(for: MaintenanceReview.Input(
+            bootVolume: snapshot.telemetry.volumes.first(where: \.isRootVolume),
+            disk: snapshot.telemetry.disk,
+            uptime: ProcessInfo.processInfo.systemUptime,
+            memory: snapshot.telemetry.memory,
+            swap: snapshot.telemetry.swap,
+            battery: snapshot.telemetry.battery,
+            security: securityDetails
+        ))
+    }
+
     private var graphSection: some View {
         SectionPanel(title: "Gráficas", symbol: "chart.xyaxis.line") {
-            HStack {
+            HStack(spacing: 10) {
+                Picker("Periodo", selection: $historyRange) {
+                    ForEach(TelemetryHistoryRange.allCases) { range in
+                        Text(range.title).tag(range)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(maxWidth: 300)
+
+                if isLoadingHistory {
+                    ProgressView().controlSize(.small)
+                }
+
+                Spacer()
+
                 Button {
                     exportPersistentHistory()
                 } label: {
                     Label("Exportar CSV", systemImage: "square.and.arrow.up")
                 }
-                Spacer()
             }
 
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: 220), spacing: 12)], spacing: 12) {
+            if historyRange == .live {
+                liveCharts
+            } else if historyRows.isEmpty && !isLoadingHistory {
+                EmptyStateView(message: "Todavía no hay historial guardado en este periodo. Se graba una muestra cada 30 s mientras la app está abierta.")
+            } else {
+                historyCharts
+            }
+        }
+    }
+
+    private var historyCharts: some View {
+        ResponsiveChartGrid(charts: [
+            historyChart("CPU total", symbol: "cpu", column: "cpu_percent", unit: "%"),
+            historyChart("GPU", symbol: "square.stack.3d.up.fill", column: "gpu_percent", unit: "%"),
+            historyChart("Temperatura max", symbol: "thermometer.medium", column: "max_temperature_c", unit: "C"),
+            historyChart("Temperatura CPU", symbol: "thermometer.medium", column: "cpu_temperature_c", unit: "C"),
+            historyChart("Temperatura GPU", symbol: "thermometer.medium", column: "gpu_temperature_c", unit: "C"),
+            historyChart("RPM media", symbol: "fanblades", column: "average_rpm", unit: "RPM", decimals: 0),
+            historyChart("Potencia sistema", symbol: "bolt", column: "system_power_w", unit: "W"),
+            historyChart("Batería", symbol: "battery.75percent", column: "battery_percent", unit: "%", decimals: 0),
+            historyChart("Carga/descarga", symbol: "bolt.batteryblock", column: "battery_power_w", unit: "W"),
+            historyChart("Memoria usada", symbol: "memorychip", column: "ram_percent", unit: "%", decimals: 0),
+            historyChart("Swap", symbol: "arrow.left.arrow.right.square", column: "swap_used_bytes", unit: "GB", transform: { $0 / 1_073_741_824 }),
+            historyChart("Carga media 1 min", symbol: "gauge.with.dots.needle.33percent", column: "load_average_1m", unit: ""),
+            historyRateChart("Red bajada", symbol: "arrow.down.circle", column: "network_down_bps"),
+            historyRateChart("Red subida", symbol: "arrow.up.circle", column: "network_up_bps"),
+            historyRateChart("Disco lectura", symbol: "arrow.down.doc", column: "disk_read_bps"),
+            historyRateChart("Disco escritura", symbol: "arrow.up.doc", column: "disk_write_bps")
+        ])
+    }
+
+    private func historyChart(
+        _ title: String,
+        symbol: String,
+        column: String,
+        unit: String,
+        decimals: Int = 1,
+        transform: @escaping (Double) -> Double = { $0 }
+    ) -> SparklineChartView {
+        let data = TelemetryChartSeries.history(historyRows, column: column, range: historyRange, transform: transform)
+        let values = data.points.map(\.value)
+        let format = "%.\(decimals)f"
+        let average = values.isEmpty ? nil : values.reduce(0, +) / Double(values.count)
+        return SparklineChartView(
+            title: title,
+            value: average.map { String(format: format, $0) } ?? "sin datos",
+            unit: unit,
+            symbol: symbol,
+            points: data,
+            footnote: values.max().map { "media · máx \(String(format: format, $0)) \(unit)" }
+        )
+    }
+
+    private func historyRateChart(_ title: String, symbol: String, column: String) -> SparklineChartView {
+        let data = TelemetryChartSeries.history(historyRows, column: column, range: historyRange)
+        let values = data.points.map(\.value)
+        let average = values.isEmpty ? nil : values.reduce(0, +) / Double(values.count)
+        return SparklineChartView(
+            title: title,
+            value: average.map(formatRateValue) ?? "sin datos",
+            unit: average.map(rateUnit) ?? "",
+            symbol: symbol,
+            points: data,
+            footnote: values.max().map { "media · máx \(formatRate($0))" }
+        )
+    }
+
+    private var liveCharts: some View {
+            ResponsiveChartGrid(charts: [
                 SparklineChartView(
                     title: "CPU total",
                     value: history.latestCPUUsage.map(formatPercent) ?? "sin datos",
                     unit: "",
                     symbol: "cpu",
                     points: history.cpuPoints
-                )
-
+                ),
                 SparklineChartView(
                     title: "GPU",
                     value: history.latestGPUUsage.map(formatPercent) ?? "sin datos",
                     unit: "",
-                    symbol: "gpu",
+                    symbol: "square.stack.3d.up.fill",
                     points: history.gpuPoints
-                )
-
+                ),
                 SparklineChartView(
                     title: "Temperatura max",
                     value: history.latestMaxTemperature.map(formatTemperatureValue) ?? "sin datos",
                     unit: "C",
                     symbol: "thermometer.medium",
                     points: history.temperaturePoints
-                )
-
+                ),
                 SparklineChartView(
                     title: "Temperatura GPU",
                     value: history.latestGPUTemperature.map(formatTemperatureValue) ?? "sin datos",
                     unit: "C",
                     symbol: "thermometer.medium",
                     points: history.gpuTemperaturePoints
-                )
-
+                ),
                 SparklineChartView(
                     title: "RPM media",
                     value: history.latestAverageRPM.map { "\(Int($0.rounded()))" } ?? "sin datos",
                     unit: "RPM",
                     symbol: "fanblades",
                     points: history.rpmPoints
-                )
-
+                ),
                 SparklineChartView(
                     title: "Potencia sistema",
                     value: history.latestSystemPower.map { String(format: "%.1f", $0) } ?? "sin datos",
                     unit: "W",
                     symbol: "bolt",
                     points: history.powerPoints
-                )
-
+                ),
                 SparklineChartView(
                     title: "Memoria usada",
                     value: history.latestMemoryRatio.map(formatPercent) ?? "sin datos",
                     unit: "",
                     symbol: "memorychip",
                     points: history.memoryPoints
-                )
-
+                ),
                 SparklineChartView(
                     title: "Red bajada",
                     value: history.latestNetworkDownBps.map(formatRateValue) ?? "sin datos",
                     unit: history.latestNetworkDownBps.map(rateUnit) ?? "",
                     symbol: "arrow.down.circle",
                     points: history.networkDownPoints
-                )
-
+                ),
                 SparklineChartView(
                     title: "Red subida",
                     value: history.latestNetworkUpBps.map(formatRateValue) ?? "sin datos",
                     unit: history.latestNetworkUpBps.map(rateUnit) ?? "",
                     symbol: "arrow.up.circle",
                     points: history.networkUpPoints
-                )
-
+                ),
                 SparklineChartView(
                     title: "Disco lectura",
                     value: history.latestDiskReadBps.map(formatRateValue) ?? "sin datos",
                     unit: history.latestDiskReadBps.map(rateUnit) ?? "",
                     symbol: "arrow.down.doc",
                     points: history.diskReadPoints
-                )
-
+                ),
                 SparklineChartView(
                     title: "Disco escritura",
                     value: history.latestDiskWriteBps.map(formatRateValue) ?? "sin datos",
@@ -359,12 +504,32 @@ private struct DiagnosticsRootView: View {
                     symbol: "arrow.up.doc",
                     points: history.diskWritePoints
                 )
-            }
-        }
+            ])
     }
 
     private var macTelemetrySection: some View {
-        SectionPanel(title: "Mac", symbol: "desktopcomputer") {
+        SectionPanel(title: "Mac", symbol: DashboardSection.mac.symbol(battery: snapshot.telemetry.battery)) {
+            HStack(spacing: 14) {
+                Image(nsImage: NSImage(named: NSImage.computerName) ?? NSApp.applicationIconImage)
+                    .resizable()
+                    .interpolation(.high)
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: 64, height: 64)
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(hardwareDetails?.modelName ?? snapshot.system.model)
+                        .font(.system(size: 18, weight: .semibold))
+                    Text([hardwareDetails?.chip ?? snapshot.system.processor, hardwareDetails?.memory].compactMap { $0 }.joined(separator: " · "))
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                    Text([osDetails.version, osDetails.build.map { "(\($0))" }].compactMap { $0 }.joined(separator: " "))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer(minLength: 0)
+            }
+
             LazyVGrid(columns: [GridItem(.adaptive(minimum: 180), spacing: 12)], spacing: 12) {
                 MetricView(
                     title: "CPU",
@@ -424,8 +589,24 @@ private struct DiagnosticsRootView: View {
         }
     }
 
+    private var coreCountDescription: String {
+        let cpu = snapshot.telemetry.cpu
+        if let performance = cpu.performanceCoreCount, let efficiency = cpu.efficiencyCoreCount {
+            return "\(cpu.coreCount) (\(performance)P + \(efficiency)E)"
+        }
+        return "\(cpu.coreCount)"
+    }
+
+    private var loadAverageTint: Color {
+        let cpu = snapshot.telemetry.cpu
+        guard let load = cpu.loadAverage.first, cpu.coreCount > 0 else { return .secondary }
+        let ratio = load / Double(cpu.coreCount)
+        return ratio >= 1.5 ? .red : ratio >= 1 ? .orange : .secondary
+    }
+
     private var cpuSection: some View {
-        SectionPanel(title: "CPU", symbol: "cpu") {
+        let cpu = snapshot.telemetry.cpu
+        return SectionPanel(title: "CPU", symbol: "cpu") {
             LazyVGrid(columns: [GridItem(.adaptive(minimum: 170), spacing: 12)], spacing: 12) {
                 MetricView(
                     title: "Uso total",
@@ -434,29 +615,55 @@ private struct DiagnosticsRootView: View {
                     tint: .accentColor
                 )
                 MetricView(
+                    title: "Usuario / sistema",
+                    value: history.latest?.cpuUserRatio.flatMap { user in
+                        history.latest?.cpuSystemRatio.map { "\(formatPercent(user)) / \(formatPercent($0))" }
+                    } ?? "calculando",
+                    symbol: "person.2",
+                    tint: .secondary
+                )
+                MetricView(
+                    title: "Carga media 1 / 5 / 15 min",
+                    value: cpu.loadAverage.count == 3
+                        ? cpu.loadAverage.map { String(format: "%.2f", $0) }.joined(separator: " / ")
+                        : "sin datos",
+                    symbol: "gauge.with.dots.needle.33percent",
+                    tint: loadAverageTint
+                )
+                MetricView(
                     title: "Núcleos",
-                    value: "\(snapshot.telemetry.cpu.coreCount)",
+                    value: coreCountDescription,
                     symbol: "circle.grid.3x3",
                     tint: .secondary
                 )
                 MetricView(
-                    title: "Memoria",
-                    value: formatPercent(snapshot.telemetry.memory.usedRatio),
-                    symbol: "memorychip",
+                    title: "Procesos",
+                    value: cpu.processCount.map(String.init) ?? "sin datos",
+                    symbol: "list.number",
                     tint: .secondary
                 )
+                MetricView(
+                    title: "Temperatura CPU",
+                    value: snapshot.sensors?.readings(type: .temperature, group: .cpu).map(\.value).max().map(formatTemperature) ?? "sin datos",
+                    symbol: "thermometer.medium",
+                    tint: temperatureTint(snapshot.sensors?.readings(type: .temperature, group: .cpu).map { Double($0.value) }.max())
+                )
             }
+
+            Text("La carga media cuenta procesos listos para ejecutarse; por encima de \(cpu.coreCount) el Mac tiene más trabajo que núcleos.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
 
             if history.latestCoreUsages.isEmpty {
                 EmptyStateView(message: "Calculando uso por núcleo...")
             } else {
-                CPUCoreUsageGridView(usages: history.latestCoreUsages)
+                CPUCoreUsageGridView(usages: history.latestCoreUsages, cpu: cpu)
             }
         }
     }
 
     private var gpuSection: some View {
-        SectionPanel(title: "GPU", symbol: "gpu") {
+        SectionPanel(title: "GPU", symbol: "square.stack.3d.up.fill") {
             let gpu = snapshot.telemetry.gpu
             let gpuTemperatures = snapshot.sensors?.readings(type: .temperature, group: .gpu).sortedBySensorNumber() ?? []
             let gpuPower = snapshot.sensors?.readings(type: .power, group: .gpu).first
@@ -466,7 +673,7 @@ private struct DiagnosticsRootView: View {
                 MetricView(
                     title: "Uso GPU",
                     value: history.latestGPUUsage.map(formatPercent) ?? "sin datos",
-                    symbol: "gpu",
+                    symbol: "square.stack.3d.up.fill",
                     tint: .accentColor
                 )
                 MetricView(
@@ -583,6 +790,23 @@ private struct DiagnosticsRootView: View {
                 InfoRow(title: "Porcentaje", value: formatPercent(memory.usedRatio))
                 InfoRow(title: "Total", value: formatBytes(memory.totalBytes))
                 InfoRow(title: "Swap total", value: formatBytes(snapshot.telemetry.swap.totalBytes))
+                InfoRow(
+                    title: "Compresión",
+                    value: memory.compressionRatio.map {
+                        String(format: "%.1f : 1 (%@ guardados en %@)", $0, formatBytes(memory.uncompressedInCompressorBytes), formatBytes(memory.compressedBytes))
+                    } ?? "sin memoria comprimida"
+                )
+                InfoRow(
+                    title: "Paginación",
+                    value: "entrada \(history.latest?.pageInBps.map(formatRate) ?? "--") · salida \(history.latest?.pageOutBps.map(formatRate) ?? "--")"
+                )
+                InfoRow(
+                    title: "Swap activo",
+                    value: "entrada \(history.latest?.swapInBps.map(formatRate) ?? "--") · salida \(history.latest?.swapOutBps.map(formatRate) ?? "--")"
+                )
+                Text("Si el swap de salida sube de forma sostenida, la RAM se queda corta para lo que tienes abierto.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             if !memoryTemperatures.isEmpty {
@@ -597,63 +821,246 @@ private struct DiagnosticsRootView: View {
     }
 
     private var networkSection: some View {
-        SectionPanel(title: "Red", symbol: "network") {
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: 170), spacing: 12)], spacing: 12) {
-                MetricView(
-                    title: "Bajada total",
-                    value: history.latestNetworkDownBps.map(formatRate) ?? "0 B/s",
-                    symbol: "arrow.down.circle",
-                    tint: .accentColor
-                )
-                MetricView(
-                    title: "Subida total",
-                    value: history.latestNetworkUpBps.map(formatRate) ?? "0 B/s",
-                    symbol: "arrow.up.circle",
-                    tint: .accentColor
-                )
-                MetricView(
-                    title: "Interfaces",
-                    value: "\(snapshot.telemetry.network.interfaces.count)",
-                    symbol: "network",
-                    tint: .secondary
-                )
+        let network = snapshot.telemetry.network
+        let primaryName = routeDetails?.primaryInterface
+        let primary = network.interfaces.first { $0.name == primaryName }
+
+        return VStack(spacing: 14) {
+            SectionPanel(title: "Conexión", symbol: connectivity?.isConnected == false ? "wifi.slash" : "network") {
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 170), spacing: 12)], spacing: 12) {
+                    MetricView(
+                        title: "Estado",
+                        value: connectivity.map { $0.isConnected ? "Conectado" : "Sin conexión" } ?? "Comprobando",
+                        symbol: connectivity?.isConnected == false ? "xmark.circle" : "checkmark.circle",
+                        tint: connectivity?.isConnected == false ? .red : .green
+                    )
+                    MetricView(
+                        title: "Latencia a Internet",
+                        value: connectivity?.latencyMilliseconds.map { String(format: "%.0f ms", $0) }
+                            ?? (connectivity?.checkedAt == nil ? "midiendo" : "sin respuesta"),
+                        symbol: "timer",
+                        tint: latencyTint(connectivity?.latencyMilliseconds)
+                    )
+                    MetricView(
+                        title: "Bajada",
+                        value: history.latestNetworkDownBps.map(formatRate) ?? "0 B/s",
+                        symbol: "arrow.down.circle",
+                        tint: .accentColor
+                    )
+                    MetricView(
+                        title: "Subida",
+                        value: history.latestNetworkUpBps.map(formatRate) ?? "0 B/s",
+                        symbol: "arrow.up.circle",
+                        tint: .accentColor
+                    )
+                }
+
+                VStack(alignment: .leading, spacing: 6) {
+                    InfoRow(title: "Interfaz principal", value: primary.map { "\($0.displayName) (\($0.name))" } ?? primaryName ?? "ninguna")
+                    InfoRow(title: "IP local", value: primary?.ipv4Addresses.first ?? "sin IPv4")
+                    if let ipv6 = primary?.ipv6Addresses.first {
+                        InfoRow(title: "IPv6", value: ipv6)
+                    }
+                    InfoRow(title: "Router", value: routeDetails?.router ?? "sin datos")
+                    InfoRow(title: "DNS", value: routeDetails.map { $0.dnsServers.isEmpty ? "sin datos" : $0.dnsServers.prefix(3).joined(separator: ", ") } ?? "sin datos")
+                    if connectivity?.isExpensive == true || connectivity?.isConstrained == true {
+                        InfoRow(
+                            title: "Tipo",
+                            value: [connectivity?.isExpensive == true ? "datos móviles / compartida" : nil, connectivity?.isConstrained == true ? "modo datos reducidos" : nil]
+                                .compactMap { $0 }.joined(separator: ", ")
+                        )
+                    }
+                    InfoRow(
+                        title: "Desde arranque",
+                        value: "↓ \(formatBytes(network.totalReceivedBytes)) · ↑ \(formatBytes(network.totalSentBytes))"
+                    )
+                }
             }
 
-            NetworkInterfaceRateView(rates: history.latestNetworkInterfaceRates)
+            SectionPanel(title: "Tráfico por aplicación", symbol: "app.connected.to.app.below.fill") {
+                AppNetworkUsageList(usage: appNetworkUsage)
+            }
+
+            if let wifi = wifiDetails {
+                wifiPanel(wifi)
+            }
+
+            SectionPanel(title: "Interfaces", symbol: "point.3.connected.trianglepath.dotted") {
+                NetworkInterfaceDetailList(
+                    interfaces: network.interfaces,
+                    rates: history.latestNetworkInterfaceRates,
+                    primaryName: primaryName
+                )
+            }
+        }
+    }
+
+    private func wifiPanel(_ wifi: WiFiDetails) -> some View {
+        SectionPanel(title: "Wi-Fi", symbol: wifi.isPoweredOn ? "wifi" : "wifi.slash") {
+            if !wifi.isPoweredOn {
+                EmptyStateView(message: "El Wi-Fi está apagado.")
+            } else if wifi.rssi == nil && wifi.channel == nil {
+                EmptyStateView(message: "El Wi-Fi está encendido pero no hay red asociada.")
+            } else {
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 170), spacing: 12)], spacing: 12) {
+                    MetricView(
+                        title: "Señal",
+                        value: wifi.rssi.map { "\($0) dBm · \(wifi.signalQuality ?? "")" } ?? "sin datos",
+                        symbol: wifiSignalSymbol(wifi.rssi),
+                        tint: wifiSignalTint(wifi.rssi)
+                    )
+                    MetricView(
+                        title: "Velocidad de enlace",
+                        value: wifi.transmitRateMbps.map { String(format: "%.0f Mbps", $0) } ?? "sin datos",
+                        symbol: "speedometer",
+                        tint: .accentColor
+                    )
+                    MetricView(
+                        title: "Relación señal/ruido",
+                        value: wifi.signalToNoise.map { "\($0) dB" } ?? "sin datos",
+                        symbol: "waveform",
+                        tint: (wifi.signalToNoise ?? 40) < 20 ? .orange : .secondary
+                    )
+                }
+
+                VStack(alignment: .leading, spacing: 6) {
+                    InfoRow(title: "Red", value: wifi.ssid ?? "nombre oculto (requiere permiso de Ubicación)")
+                    InfoRow(
+                        title: "Canal",
+                        value: [wifi.channel.map(String.init), wifi.band, wifi.channelWidth].compactMap { $0 }.joined(separator: " · ")
+                    )
+                    InfoRow(title: "Estándar", value: wifi.standard ?? "sin datos")
+                    InfoRow(title: "Seguridad", value: wifi.security ?? "sin datos")
+                    InfoRow(title: "Ruido", value: wifi.noise.map { "\($0) dBm" } ?? "sin datos")
+                }
+            }
         }
     }
 
     private var storageSection: some View {
-        SectionPanel(title: "Disco", symbol: "internaldrive") {
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: 170), spacing: 12)], spacing: 12) {
-                MetricView(
-                    title: "Libre",
-                    value: formatBytes(snapshot.telemetry.disk.availableBytes),
-                    symbol: "internaldrive",
-                    tint: .secondary
-                )
-                MetricView(
-                    title: "Usado",
-                    value: formatPercent(snapshot.telemetry.disk.usedRatio),
-                    symbol: "chart.pie",
-                    tint: .secondary
-                )
-                MetricView(
-                    title: "Lectura",
-                    value: history.latestDiskReadBps.map(formatRate) ?? "0 B/s",
-                    symbol: "arrow.down.doc",
-                    tint: .accentColor
-                )
-                MetricView(
-                    title: "Escritura",
-                    value: history.latestDiskWriteBps.map(formatRate) ?? "0 B/s",
-                    symbol: "arrow.up.doc",
-                    tint: .accentColor
+        let volumes = snapshot.telemetry.volumes
+        let root = volumes.first(where: \.isRootVolume)
+        let rootDetails = storageDetails[root?.path ?? "/"]
+        let diskIO = snapshot.telemetry.diskIO
+
+        return VStack(spacing: 14) {
+            SectionPanel(title: "Disco de arranque", symbol: "internaldrive") {
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 170), spacing: 12)], spacing: 12) {
+                    MetricView(
+                        title: "Libre",
+                        value: formatBytes(root?.availableBytes ?? snapshot.telemetry.disk.availableBytes),
+                        symbol: "internaldrive",
+                        tint: diskFreeTint(root)
+                    )
+                    MetricView(
+                        title: "Usado",
+                        value: formatPercent(root?.usedRatio ?? snapshot.telemetry.disk.usedRatio),
+                        symbol: "chart.pie",
+                        tint: .secondary
+                    )
+                    MetricView(
+                        title: "Estado SMART",
+                        value: rootDetails?.smartStatus.map(localizedSMARTStatus) ?? "comprobando",
+                        symbol: rootDetails?.smartStatus == "Verified" ? "checkmark.shield" : "exclamationmark.shield",
+                        tint: rootDetails?.smartStatus == nil ? .secondary : rootDetails?.smartStatus == "Verified" ? .green : .orange
+                    )
+                    MetricView(
+                        title: "Cifrado",
+                        value: rootDetails?.isEncrypted.map { $0 ? "FileVault activo" : "Sin cifrar" } ?? "comprobando",
+                        symbol: rootDetails?.isEncrypted == false ? "lock.open" : "lock",
+                        tint: rootDetails?.isEncrypted == false ? .orange : .secondary
+                    )
+                }
+
+                if let root {
+                    VolumeUsageBar(volume: root)
+                }
+
+                VStack(alignment: .leading, spacing: 6) {
+                    InfoRow(title: "Volumen", value: root?.name ?? snapshot.telemetry.disk.volumeName)
+                    InfoRow(title: "Modelo", value: rootDetails?.mediaName ?? "sin datos")
+                    InfoRow(
+                        title: "Conexión",
+                        value: [rootDetails?.busProtocol, rootDetails?.isSolidState == true ? "SSD" : nil].compactMap { $0 }.joined(separator: " · ")
+                    )
+                    InfoRow(
+                        title: "Sistema de archivos",
+                        value: [rootDetails?.fileSystem, root?.format].compactMap { $0 }.first ?? "sin datos"
+                    )
+                    if let physical = rootDetails?.physicalSizeBytes {
+                        InfoRow(title: "Tamaño físico", value: formatBytes(physical))
+                    }
+                    InfoRow(
+                        title: "Capacidad",
+                        value: "\(formatBytes(root?.usedBytes ?? snapshot.telemetry.disk.usedBytes)) usados de \(formatBytes(root?.totalBytes ?? snapshot.telemetry.disk.totalBytes))"
+                    )
+                }
+            }
+
+            SectionPanel(title: "Actividad del disco", symbol: "arrow.up.arrow.down") {
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 170), spacing: 12)], spacing: 12) {
+                    MetricView(
+                        title: "Lectura",
+                        value: history.latestDiskReadBps.map(formatRate) ?? "0 B/s",
+                        symbol: "arrow.down.doc",
+                        tint: .accentColor
+                    )
+                    MetricView(
+                        title: "Escritura",
+                        value: history.latestDiskWriteBps.map(formatRate) ?? "0 B/s",
+                        symbol: "arrow.up.doc",
+                        tint: .accentColor
+                    )
+                    MetricView(
+                        title: "Operaciones/s",
+                        value: snapshot.diskReadOpsPerSecond.flatMap { reads in
+                            snapshot.diskWriteOpsPerSecond.map { "\(Int(reads.rounded())) L · \(Int($0.rounded())) E" }
+                        } ?? "calculando",
+                        symbol: "speedometer",
+                        tint: .secondary
+                    )
+                }
+                InfoRow(
+                    title: "Desde arranque",
+                    value: "leídos \(formatBytes(diskIO.readBytes)) · escritos \(formatBytes(diskIO.writtenBytes))"
                 )
             }
 
-            InfoRow(title: "Volumen", value: snapshot.telemetry.disk.volumeName)
-            InfoRow(title: "Capacidad", value: "\(formatBytes(snapshot.telemetry.disk.usedBytes)) usado de \(formatBytes(snapshot.telemetry.disk.totalBytes))")
+            SectionPanel(title: "Volúmenes", symbol: "externaldrive") {
+                if volumes.isEmpty {
+                    EmptyStateView(message: "Calculando volúmenes...")
+                } else {
+                    ForEach(volumes) { volume in
+                        VolumeRowView(volume: volume, details: storageDetails[volume.path]) {
+                            ejectVolume(volume)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func diskFreeTint(_ volume: VolumeSnapshot?) -> Color {
+        guard let volume, volume.totalBytes > 0 else { return .secondary }
+        let free = 1 - volume.usedRatio
+        return free < 0.05 ? .red : free < 0.12 ? .orange : .secondary
+    }
+
+    private func ejectVolume(_ volume: VolumeSnapshot) {
+        statusMessage = "Expulsando \(volume.name)..."
+        let url = URL(fileURLWithPath: volume.path)
+        Task.detached(priority: .userInitiated) {
+            let result: String
+            do {
+                try NSWorkspace.shared.unmountAndEjectDevice(at: url)
+                result = "\(volume.name) expulsado."
+            } catch {
+                result = "No se pudo expulsar \(volume.name): \(error.localizedDescription)"
+            }
+            await MainActor.run {
+                statusMessage = result
+                reloadSnapshot(status: nil, includeSMC: false, fullTelemetry: true, force: true)
+            }
         }
     }
 
@@ -733,8 +1140,8 @@ private struct DiagnosticsRootView: View {
                 EmptyStateView(message: fanError)
             } else if let fans = snapshot.fans {
                 HStack(spacing: 10) {
-                    Text("Modo \(fans.modeKeyFormat ?? "desconocido")")
-                    Text(fans.forceTestAvailable ? "Ftst disponible" : "Ftst no disponible")
+                    Text(fans.modeKeyFormat == nil ? "Control manual no disponible" : "Control manual disponible")
+                        .help("Clave SMC de modo: \(fans.modeKeyFormat ?? "no encontrada") · Ftst \(fans.forceTestAvailable ? "disponible" : "no disponible")")
                     Spacer()
                     Button(role: .destructive) {
                         setAllFansTurbo()
@@ -799,18 +1206,212 @@ private struct DiagnosticsRootView: View {
     }
 
     private var powerSection: some View {
-        SectionPanel(title: "Energía", symbol: "bolt") {
-            let power = snapshot.sensors?.readings(type: .power) ?? []
+        let power = snapshot.sensors?.readings(type: .power) ?? []
 
-            if power.isEmpty {
-                EmptyStateView(message: "Sin lecturas de potencia por ahora.")
-            } else {
-                SensorGroupView(
-                    title: "Potencia",
-                    readings: power,
-                    formatter: { String(format: "%.1f W", $0) },
-                    ceiling: 120
+        return VStack(spacing: 14) {
+            if let battery = snapshot.telemetry.battery {
+                batteryPanel(battery)
+                powerFlowPanel(battery)
+            }
+
+            SectionPanel(title: "Sensores de potencia", symbol: "bolt") {
+                ResponsiveChartGrid(charts: [
+                    SparklineChartView(
+                        title: "Consumo del sistema",
+                        value: (history.latest?.systemLoadPower ?? history.latestSystemPower).map { String(format: "%.1f", $0) } ?? "sin datos",
+                        unit: "W",
+                        symbol: "bolt",
+                        points: history.latest?.systemLoadPower != nil ? history.systemLoadPowerPoints : history.powerPoints
+                    ),
+                    SparklineChartView(
+                        title: "Batería (+ carga / − descarga)",
+                        value: history.latest?.batteryPower.map { String(format: "%+.1f", $0) } ?? "sin datos",
+                        unit: "W",
+                        symbol: "bolt.batteryblock",
+                        points: history.batteryPowerPoints
+                    )
+                ])
+
+                if power.isEmpty {
+                    EmptyStateView(message: "Sin lecturas de potencia SMC por ahora.")
+                } else {
+                    SensorGroupView(
+                        title: "SMC",
+                        readings: power,
+                        formatter: { String(format: "%.1f W", $0) },
+                        ceiling: 120
+                    )
+                }
+            }
+        }
+    }
+
+    private func batteryPanel(_ battery: BatterySnapshot) -> some View {
+        SectionPanel(title: "Batería", symbol: batterySymbolName(battery)) {
+            HStack(alignment: .center, spacing: 16) {
+                BatteryGlyph(battery: battery, height: 30)
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("\(battery.percent)%")
+                        .font(.system(size: 26, weight: .semibold, design: .rounded).monospacedDigit())
+                    Text(batteryHeadline(battery))
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer(minLength: 0)
+            }
+
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 170), spacing: 12)], spacing: 12) {
+                MetricView(
+                    title: "Condición",
+                    value: battery.condition.map(localizedBatteryCondition) ?? "sin datos",
+                    symbol: "heart.text.square",
+                    tint: battery.condition.map { localizedBatteryCondition($0) == "Normal" ? Color.green : .orange } ?? .secondary
                 )
+                MetricView(
+                    title: "Capacidad máxima",
+                    value: battery.healthPercent.map { "\($0)%" } ?? "sin datos",
+                    symbol: "battery.100percent",
+                    tint: (battery.healthPercent ?? 100) < 80 ? .orange : .secondary
+                )
+                MetricView(
+                    title: "Ciclos",
+                    value: battery.cycleCount.map { cycles in
+                        battery.designCycleCount.map { "\(cycles) de \($0)" } ?? "\(cycles)"
+                    } ?? "sin datos",
+                    symbol: "arrow.triangle.2.circlepath",
+                    tint: .secondary
+                )
+                MetricView(
+                    title: "Temperatura",
+                    value: battery.temperatureCelsius.map { String(format: "%.1f C", $0) } ?? "sin datos",
+                    symbol: "thermometer.medium",
+                    tint: (battery.temperatureCelsius ?? 0) >= 40 ? .orange : .secondary
+                )
+                MetricView(
+                    title: "Voltaje",
+                    value: battery.voltageMillivolts.map { String(format: "%.2f V", Double($0) / 1_000) } ?? "sin datos",
+                    symbol: "bolt.horizontal",
+                    tint: .secondary
+                )
+                MetricView(
+                    title: "Corriente",
+                    value: battery.amperageMilliamps.map { String(format: "%+.2f A", Double($0) / 1_000) } ?? "sin datos",
+                    symbol: "waveform.path",
+                    tint: .secondary
+                )
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                InfoRow(
+                    title: "Carga actual",
+                    value: battery.currentCapacityMah.map { current in
+                        battery.fullChargeCapacityMah.map { "\(current) de \($0) mAh" } ?? "\(current) mAh"
+                    } ?? "sin datos"
+                )
+                InfoRow(
+                    title: "Capacidad",
+                    value: [
+                        battery.fullChargeCapacityMah.map { "completa \($0) mAh" },
+                        battery.maxCapacity.map { "nominal \($0) mAh" },
+                        battery.designCapacity.map { "diseño \($0) mAh" }
+                    ].compactMap { $0 }.joined(separator: " · ")
+                )
+                if battery.isChargingPaused {
+                    InfoRow(title: "Carga en pausa", value: "Carga optimizada, límite de carga o temperatura alta")
+                }
+            }
+            Text("Una batería nueva puede superar su capacidad de diseño; macOS limita la capacidad máxima al 100%.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private func powerFlowPanel(_ battery: BatterySnapshot) -> some View {
+        SectionPanel(title: battery.externalConnected ? "Alimentación" : "Consumo", symbol: battery.externalConnected ? "powerplug" : "bolt.batteryblock") {
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 170), spacing: 12)], spacing: 12) {
+                if battery.externalConnected {
+                    MetricView(
+                        title: "Entrada del cargador",
+                        value: battery.systemPowerInWatts.map { String(format: "%.1f W", $0) } ?? "sin datos",
+                        symbol: "powerplug.fill",
+                        tint: .green
+                    )
+                }
+                MetricView(
+                    title: "Consumo del sistema",
+                    value: battery.systemLoadWatts.map { String(format: "%.1f W", $0) } ?? "sin datos",
+                    symbol: "laptopcomputer",
+                    tint: .accentColor
+                )
+                MetricView(
+                    title: (battery.batteryPowerWatts ?? 0) >= 0 ? "Hacia la batería" : "Desde la batería",
+                    value: battery.batteryPowerWatts.map { String(format: "%.1f W", abs($0)) } ?? "sin datos",
+                    symbol: (battery.batteryPowerWatts ?? 0) >= 0 ? "battery.100percent.bolt" : "battery.50percent",
+                    tint: (battery.batteryPowerWatts ?? 0) >= 0 ? .green : .orange
+                )
+            }
+
+            if let adapter = battery.adapter {
+                VStack(alignment: .leading, spacing: 6) {
+                    InfoRow(title: "Cargador", value: adapter.name ?? "conectado")
+                    InfoRow(
+                        title: "Negociado",
+                        value: [
+                            adapter.watts.map { "\($0) W" },
+                            adapter.voltageMillivolts.map { String(format: "%.0f V", Double($0) / 1_000) },
+                            adapter.currentMilliamps.map { String(format: "%.2f A", Double($0) / 1_000) }
+                        ].compactMap { $0 }.joined(separator: " · ")
+                    )
+                    if let manufacturer = adapter.manufacturer {
+                        InfoRow(title: "Fabricante", value: adapter.isWireless ? "\(manufacturer) (inalámbrico)" : manufacturer)
+                    }
+                }
+                if let input = battery.systemPowerInWatts, let watts = adapter.watts, watts > 0, input >= Double(watts) * 0.9 {
+                    Text("El cargador va al límite: si el consumo sube, la batería dejará de cargar o se descargará.")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
+            } else if !battery.externalConnected {
+                InfoRow(title: "Cargador", value: "desconectado")
+            }
+        }
+    }
+
+    private func batteryHeadline(_ battery: BatterySnapshot) -> String {
+        if battery.isCharged || (battery.externalConnected && battery.percent >= 100) {
+            return "Cargada y conectada"
+        }
+        if battery.isCharging {
+            return battery.timeToFullMinutes.map { "Cargando · llena en \(formatBatteryMinutes($0))" } ?? "Cargando"
+        }
+        if battery.externalConnected {
+            return "Conectada, carga en pausa"
+        }
+        return battery.timeToEmptyMinutes.map { "Con batería · quedan \(formatBatteryMinutes($0))" } ?? "Con batería · calculando autonomía"
+    }
+
+    private var activitySection: some View {
+        SectionPanel(title: "Actividad", symbol: "clock.arrow.circlepath") {
+            HStack {
+                Text("Alertas, cambios de ventiladores, cargador, estado térmico y reposo de los últimos 30 días.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button(role: .destructive) {
+                    EventLog.shared.clear()
+                    events = []
+                } label: {
+                    Label("Borrar", systemImage: "trash")
+                }
+                .disabled(events.isEmpty)
+            }
+
+            if events.isEmpty {
+                EmptyStateView(message: "Todavía no hay eventos registrados.")
+            } else {
+                EventTimelineView(events: events)
             }
         }
     }
@@ -820,15 +1421,44 @@ private struct DiagnosticsRootView: View {
             SectionPanel(title: "Estado del sistema", symbol: "checkmark.shield") {
                 HealthStatusRow(title: "Accesibilidad", value: accessibilityTrusted ? "Activa" : "Falta permiso", isHealthy: accessibilityTrusted)
                 HealthStatusRow(title: "Monitorización de entrada", value: inputMonitoringTrusted ? "Activa" : "Falta permiso", isHealthy: inputMonitoringTrusted)
-                HealthStatusRow(title: "Helper de ventiladores", value: helperAvailable == true ? "Activo" : helperAvailable == false ? "No disponible" : "Comprobando...", isHealthy: helperAvailable == true)
-                HealthStatusRow(title: "Sensores SMC", value: snapshot.sensors == nil ? "Sin lecturas" : "Disponibles", isHealthy: snapshot.sensors != nil)
+                HealthStatusRow(title: "Helper de ventiladores", value: helperStatusText, isHealthy: helperAvailable == true)
+                HealthStatusRow(title: "Sensores SMC", value: snapshot.sensorStatus.description, isHealthy: snapshot.sensorStatus.isCurrent)
+                HealthStatusRow(title: "Ventiladores SMC", value: snapshot.fanStatus.description, isHealthy: snapshot.fanStatus.isCurrent)
                 HealthStatusRow(title: "Última lectura", value: lastTelemetryDate?.formatted(date: .omitted, time: .standard) ?? "Esperando...", isHealthy: lastTelemetryDate != nil)
             }
 
-            SectionPanel(title: "Sistema", symbol: "macbook") {
-            InfoRow(title: "Modelo", value: snapshot.system.model)
-            InfoRow(title: "Procesador", value: snapshot.system.processor)
-            InfoRow(title: "Uptime", value: snapshot.system.uptime)
+            SectionPanel(title: "Seguridad", symbol: "lock.shield") {
+                if let securityDetails {
+                    HealthStatusRow(title: "Protección de integridad (SIP)", value: securityValue(securityDetails.systemIntegrityProtection), isHealthy: securityDetails.systemIntegrityProtection == true)
+                    HealthStatusRow(title: "FileVault", value: securityValue(securityDetails.fileVault), isHealthy: securityDetails.fileVault == true)
+                    HealthStatusRow(title: "Gatekeeper", value: securityValue(securityDetails.gatekeeper), isHealthy: securityDetails.gatekeeper == true)
+                    HealthStatusRow(title: "Firewall", value: securityValue(securityDetails.firewall), isHealthy: securityDetails.firewall == true)
+                } else {
+                    EmptyStateView(message: "Comprobando...")
+                }
+            }
+
+            SectionPanel(title: "Sistema", symbol: "info.circle") {
+            InfoRow(title: "Modelo", value: [hardwareDetails?.modelName, hardwareDetails?.modelIdentifier ?? snapshot.system.model].compactMap { $0 }.joined(separator: " · "))
+            if let number = hardwareDetails?.modelNumber {
+                InfoRow(title: "Referencia", value: number)
+            }
+            InfoRow(title: "Chip", value: hardwareDetails?.chip ?? snapshot.system.processor)
+            if let cores = hardwareDetails?.coreSummary {
+                InfoRow(title: "Núcleos", value: cores)
+            }
+            if let memory = hardwareDetails?.memory {
+                InfoRow(title: "Memoria", value: memory)
+            }
+            InfoRow(title: "macOS", value: [osDetails.version, osDetails.build.map { "(\($0))" }].compactMap { $0 }.joined(separator: " "))
+            if let firmware = hardwareDetails?.firmware {
+                InfoRow(title: "Firmware", value: firmware)
+            }
+            InfoRow(
+                title: "Encendido",
+                value: osDetails.bootDate.map { "\(snapshot.system.uptime) · desde \($0.formatted(date: .abbreviated, time: .shortened))" } ?? snapshot.system.uptime
+            )
+            InfoRow(title: "Bajo consumo", value: snapshot.system.lowPowerMode)
             InfoRow(title: "Mantenimiento", value: appResourceSummary(snapshot.appResources))
 
             HStack {
@@ -837,9 +1467,22 @@ private struct DiagnosticsRootView: View {
                 } label: {
                     Label("Copiar diagnóstico", systemImage: "doc.on.doc")
                 }
+                Button {
+                    exportDiagnosticSummary()
+                } label: {
+                    Label("Exportar diagnóstico", systemImage: "square.and.arrow.up")
+                }
                 Spacer()
             }
             }
+        }
+    }
+
+    private func securityValue(_ enabled: Bool?) -> String {
+        switch enabled {
+        case true?: return "Activado"
+        case false?: return "Desactivado"
+        case nil: return "Sin datos"
         }
     }
 
@@ -861,21 +1504,8 @@ private struct DiagnosticsRootView: View {
 
     private var isDiagnosticsWindowVisible: Bool {
         NSApp.windows.contains { window in
-            window.title == "Mantenimiento" && window.isVisible
-        }
-    }
-
-    private func refreshLoop() async {
-        while !Task.isCancelled {
-            if isDiagnosticsWindowVisible {
-                refreshSilently()
-                if selectedSection == .cleaning {
-                    refreshPermissionState()
-                }
-            }
-
-            let interval: TimeInterval = isDiagnosticsWindowVisible ? 1.5 : 8
-            try? await Task.sleep(for: .seconds(interval))
+            window.title == "Mantenimiento" && window.isVisible && !window.isMiniaturized
+                && window.occlusionState.contains(.visible)
         }
     }
 
@@ -888,24 +1518,11 @@ private struct DiagnosticsRootView: View {
         )
     }
 
-    private func refreshSilently() {
-        guard !isWorking, !isRefreshing else {
-            return
-        }
-
-        refreshSequence += 1
-        let periodicFullRefresh = refreshSequence.isMultiple(of: 3)
-        if selectedSection == .gpu, refreshSequence.isMultiple(of: 3) {
-            refreshGPUDemand()
-        }
-        if selectedSection == .overview, refreshSequence.isMultiple(of: 3) {
-            refreshTopCPUDemand()
-        }
-        reloadSnapshot(
-            status: nil,
-            includeSMC: selectedSection.needsSMCRefresh || periodicFullRefresh,
-            fullTelemetry: selectedSection.needsFullTelemetry || periodicFullRefresh
-        )
+    private func applySnapshot(_ nextSnapshot: DashboardSnapshot) {
+        guard lastTelemetryDate.map({ nextSnapshot.date > $0 }) ?? true else { return }
+        snapshot = nextSnapshot
+        history.append(nextSnapshot)
+        lastTelemetryDate = nextSnapshot.date
     }
 
     private func reloadSnapshot(status: String?, includeSMC: Bool, fullTelemetry: Bool, force: Bool = false) {
@@ -926,16 +1543,7 @@ private struct DiagnosticsRootView: View {
             }.value
 
             await MainActor.run {
-                if status == nil {
-                    snapshot = nextSnapshot
-                    history.append(nextSnapshot)
-                } else {
-                    withAnimation(.easeInOut(duration: 0.25)) {
-                        snapshot = nextSnapshot
-                        history.append(nextSnapshot)
-                    }
-                }
-                lastTelemetryDate = Date()
+                applySnapshot(nextSnapshot)
                 if let status {
                     statusMessage = status
                 }
@@ -993,9 +1601,102 @@ private struct DiagnosticsRootView: View {
 
     private func refreshHealthStatus() {
         Task.detached(priority: .utility) {
-            let isAvailable = PrivilegedHelperInstaller.ping() != nil
+            let response = PrivilegedHelperInstaller.ping()
+            let isAvailable = response == FanHelperProtocol.greeting
             await MainActor.run {
                 helperAvailable = isAvailable
+                helperStatusText = isAvailable ? "Activo v3" : response != nil ? "Actualización necesaria" : "No disponible"
+            }
+        }
+    }
+
+    private func refreshSectionDetails(_ section: DashboardSection, force: Bool = false) {
+        let provider = SystemDetailsProvider.shared
+        switch section {
+        case .network:
+            Task.detached(priority: .utility) {
+                let wifi = provider.wifiDetails()
+                let route = provider.routeDetails()
+                let connectivity = provider.currentConnectivity()
+                await MainActor.run {
+                    wifiDetails = wifi
+                    routeDetails = route
+                    self.connectivity = connectivity
+                }
+            }
+            if !isSamplingAppNetwork {
+                isSamplingAppNetwork = true
+                Task.detached(priority: .utility) {
+                    let usage = ProcessDemandSampler.shared.appNetworkUsage()
+                    await MainActor.run {
+                        appNetworkUsage = usage
+                        isSamplingAppNetwork = false
+                    }
+                }
+            }
+            if force || lastLatencyCheck.map({ Date().timeIntervalSince($0) >= 15 }) ?? true {
+                lastLatencyCheck = Date()
+                provider.measureLatency { result in
+                    connectivity = result
+                }
+            }
+        case .storage:
+            let paths = snapshot.telemetry.volumes.map(\.path)
+            let targets = paths.isEmpty ? ["/"] : paths
+            Task.detached(priority: .utility) {
+                var loaded: [String: StorageDeviceDetails] = [:]
+                for path in targets {
+                    loaded[path] = provider.storageDetails(forVolumeAt: path)
+                }
+                let details = loaded
+                await MainActor.run {
+                    storageDetails = details
+                }
+            }
+        case .overview, .system:
+            Task.detached(priority: .utility) {
+                let security = provider.securityDetails()
+                let hardware = section == .system ? provider.hardwareDetails() : nil
+                await MainActor.run {
+                    securityDetails = security
+                    if let hardware { hardwareDetails = hardware }
+                    osDetails = provider.operatingSystemDetails()
+                }
+            }
+        case .mac:
+            guard hardwareDetails == nil else { return }
+            Task.detached(priority: .utility) {
+                let hardware = provider.hardwareDetails()
+                await MainActor.run { hardwareDetails = hardware }
+            }
+        case .activity:
+            refreshEvents()
+        case .graphs:
+            if force { loadHistory() }
+        default:
+            break
+        }
+    }
+
+    private func refreshEvents() {
+        Task.detached(priority: .utility) {
+            let loaded = EventLog.shared.events()
+            await MainActor.run { events = loaded }
+        }
+    }
+
+    private func loadHistory() {
+        guard historyRange != .live else {
+            historyRows = []
+            return
+        }
+        isLoadingHistory = true
+        let since = Date().addingTimeInterval(-historyRange.duration)
+        Task.detached(priority: .utility) {
+            let rows = TelemetryHistoryRecorder.shared.rows(since: since)
+            await MainActor.run {
+                historyRows = rows
+                isLoadingHistory = false
             }
         }
     }
@@ -1073,9 +1774,21 @@ private struct DiagnosticsRootView: View {
         }
     }
 
+    private func exportDiagnosticSummary() {
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.plainText]
+        panel.nameFieldStringValue = "mantenimiento-diagnostico.txt"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            try diagnosticSummary().write(to: url, atomically: true, encoding: .utf8)
+            statusMessage = "Diagnóstico exportado."
+        } catch { statusMessage = "No se pudo exportar el diagnóstico." }
+    }
+
     private func diagnosticSummary() -> String {
         var lines: [String] = [
             "Mantenimiento - diagnóstico rápido",
+            "Versión: \(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "desarrollo")",
             "Fecha: \(Date.now.formatted(date: .numeric, time: .standard))",
             "Modelo: \(snapshot.system.model)",
             "Procesador: \(snapshot.system.processor)",
@@ -1094,81 +1807,57 @@ private struct DiagnosticsRootView: View {
 
         if let battery = snapshot.telemetry.battery {
             lines.append("Batería: \(batterySummary(battery))")
+            if let condition = battery.condition {
+                lines.append("Condición batería: \(localizedBatteryCondition(condition))")
+            }
+            if let adapter = battery.adapter {
+                lines.append("Cargador: \(adapter.name ?? "conectado")\(adapter.watts.map { " (\($0) W)" } ?? "")")
+            }
+        }
+
+        lines.append("macOS: \(osDetails.version)\(osDetails.build.map { " (\($0))" } ?? "")")
+        if let root = snapshot.telemetry.volumes.first(where: \.isRootVolume) {
+            lines.append("Disco: \(formatBytes(root.availableBytes)) libres de \(formatBytes(root.totalBytes))\(storageDetails[root.path]?.smartStatus.map { ", SMART \(localizedSMARTStatus($0))" } ?? "")")
+        }
+        if let wifi = wifiDetails, let rssi = wifi.rssi {
+            lines.append("Wi-Fi: \(rssi) dBm\(wifi.transmitRateMbps.map { String(format: ", %.0f Mbps", $0) } ?? "")")
+        }
+        let review = maintenanceReviewItems.filter { $0.status >= .warning }
+        if !review.isEmpty {
+            lines.append("Revisión: " + review.map { "\($0.title): \($0.detail)" }.joined(separator: " | "))
         }
 
         return lines.joined(separator: "\n")
     }
 
     private func setFan(_ index: Int, _ rpm: Float) {
-        runFanAction("Aplicando \(Int(rpm)) RPM al ventilador \(index + 1)...") {
-            do {
-                let strategy = try FanService.make().setFanRPM(index: index, rpm: rpm)
-                NotificationCenter.default.post(name: .fanManualControlDidSucceed, object: nil)
-                return "Ventilador \(index + 1) en manual (\(strategy.rawValue))."
-            } catch {
-                guard PrivilegedFanTool.shouldRetryPrivileged(error) else {
-                    throw error
-                }
-
-                _ = try await Task.detached {
-                    try PrivilegedFanTool.setFanRPM(index: index, rpm: rpm)
-                }.value
-                NotificationCenter.default.post(name: .fanManualControlDidSucceed, object: nil)
-                return "Ventilador \(index + 1) en manual con autorización."
-            }
+        runFanAction("Aplicando velocidad al ventilador \(index + 1)...") {
+            _ = try await Task.detached { try PrivilegedFanTool.setFanRPM(index: index, rpm: rpm) }.value
+            NotificationCenter.default.post(name: .fanManualControlDidSucceed, object: nil)
+            return "Ventilador \(index + 1) en manual."
         }
     }
 
     private func setFanAuto(_ index: Int) {
         runFanAction("Aplicando automático al ventilador \(index + 1)...") {
-            do {
-                try FanService.make().setFanAuto(index: index)
-            } catch {
-                guard PrivilegedFanTool.shouldRetryPrivileged(error) else {
-                    throw error
-                }
-
-                _ = try await Task.detached {
-                    try PrivilegedFanTool.setFanAuto(index: index)
-                }.value
-            }
-            return "Ventilador \(index + 1) en automatico."
+            _ = try await Task.detached { try PrivilegedFanTool.setFanAuto(index: index) }.value
+            return "Ventilador \(index + 1) en automático."
         }
     }
 
     private func setAllFansAuto() {
         runFanAction("Aplicando automático a los ventiladores...") {
-            do {
-                try FanService.make().setAllFansAuto()
-            } catch {
-                guard PrivilegedFanTool.shouldRetryPrivileged(error) else {
-                    throw error
-                }
-
-                _ = try await Task.detached {
-                    try PrivilegedFanTool.setAllFansAuto()
-                }.value
-            }
+            _ = try await Task.detached { try PrivilegedFanTool.setAllFansAuto() }.value
+            NotificationCenter.default.post(name: .fanAutomaticControlDidSucceed, object: nil)
             return "Ventiladores en automático."
         }
     }
 
     private func setAllFansTurbo() {
         runFanAction("Activando turbo en todos los ventiladores...") {
-            do {
-                try FanService.make().setAllFansToMaximum()
-                NotificationCenter.default.post(name: .fanManualControlDidSucceed, object: nil)
-            } catch {
-                guard PrivilegedFanTool.shouldRetryPrivileged(error) else {
-                    throw error
-                }
-
-                _ = try await Task.detached {
-                    try PrivilegedFanTool.setAllFansTurbo()
-                }.value
-                NotificationCenter.default.post(name: .fanManualControlDidSucceed, object: nil)
-            }
-            return "Turbo activo: ventiladores al maximo."
+            _ = try await Task.detached { try PrivilegedFanTool.setAllFansTurbo() }.value
+            NotificationCenter.default.post(name: .fanManualControlDidSucceed, object: nil)
+            return "Turbo activo: ventiladores al máximo."
         }
     }
 
@@ -1184,6 +1873,7 @@ private struct DiagnosticsRootView: View {
             let message: String
             do {
                 message = try await operation()
+                EventLog.shared.record(.fans, title: message)
             } catch {
                 message = error.localizedDescription
             }
@@ -1196,16 +1886,20 @@ private struct DiagnosticsRootView: View {
             await MainActor.run {
                 statusMessage = message
                 isWorking = false
-                withAnimation(.easeInOut(duration: 0.55)) {
-                    snapshot = nextSnapshot
-                    history.append(nextSnapshot)
-                }
+                applySnapshot(nextSnapshot)
             }
         }
     }
 }
 
 private struct DashboardSnapshot {
+    let date: Date
+    let samplingEpoch: UInt64
+    let diskDate: Date
+    let diskReadBps: Double?
+    let diskWriteBps: Double?
+    let fanStatus: TelemetryReadingStatus
+    let sensorStatus: TelemetryReadingStatus
     let system: SystemSnapshot
     let fans: FanSnapshot?
     let sensors: SensorSnapshot?
@@ -1213,9 +1907,18 @@ private struct DashboardSnapshot {
     let appResources: AppResourceSnapshot
     let fanError: String?
     let sensorError: String?
+    var diskReadOpsPerSecond: Double?
+    var diskWriteOpsPerSecond: Double?
 
     static func placeholder() -> DashboardSnapshot {
         DashboardSnapshot(
+            date: .distantPast,
+            samplingEpoch: 0,
+            diskDate: .distantPast,
+            diskReadBps: nil,
+            diskWriteBps: nil,
+            fanStatus: TelemetryReadingStatus(lastSuccess: nil, error: nil, referenceDate: .now),
+            sensorStatus: TelemetryReadingStatus(lastSuccess: nil, error: nil, referenceDate: .now),
             system: SystemSnapshot(
                 model: "Mac",
                 processor: "Cargando telemetría...",
@@ -1246,14 +1949,27 @@ private struct DashboardSnapshot {
             force: force
         )
 
-        return DashboardSnapshot(
+        return make(shared: shared)
+    }
+
+    static func make(shared: SharedTelemetrySnapshot) -> DashboardSnapshot {
+        DashboardSnapshot(
+            date: shared.date,
+            samplingEpoch: shared.samplingEpoch,
+            diskDate: shared.diskDate,
+            diskReadBps: shared.diskReadBps,
+            diskWriteBps: shared.diskWriteBps,
+            fanStatus: shared.fanStatus,
+            sensorStatus: shared.sensorStatus,
             system: .current(),
-            fans: shared.fans ?? previous?.fans,
-            sensors: shared.sensors ?? previous?.sensors,
+            fans: shared.fanStatus.isCurrent ? shared.fans : nil,
+            sensors: shared.sensorStatus.isCurrent ? shared.sensors : nil,
             telemetry: shared.telemetry,
             appResources: shared.appResources,
-            fanError: shared.fanError ?? previous?.fanError,
-            sensorError: shared.sensorError ?? previous?.sensorError
+            fanError: shared.fanError,
+            sensorError: shared.sensorError,
+            diskReadOpsPerSecond: shared.diskReadOpsPerSecond,
+            diskWriteOpsPerSecond: shared.diskWriteOpsPerSecond
         )
     }
 }
@@ -1271,6 +1987,7 @@ private enum DashboardSection: String, CaseIterable, Identifiable {
     case fans
     case temperatures
     case energy
+    case activity
     case system
 
     var id: String { rawValue }
@@ -1301,6 +2018,8 @@ private enum DashboardSection: String, CaseIterable, Identifiable {
             return "Temperaturas"
         case .energy:
             return "Energía"
+        case .activity:
+            return "Actividad"
         case .system:
             return "Sistema"
         }
@@ -1332,60 +2051,58 @@ private enum DashboardSection: String, CaseIterable, Identifiable {
             return "thermometer.medium"
         case .energy:
             return "bolt"
+        case .activity:
+            return "clock.arrow.circlepath"
         case .system:
-            return "macbook"
+            return "gearshape.2"
         }
     }
 
-    var needsSMCRefresh: Bool {
+    func symbol(battery: BatterySnapshot?) -> String {
         switch self {
-        case .graphs, .gpu, .memory, .fans, .temperatures, .energy, .overview:
-            return true
-        case .mac, .cpu, .network, .storage, .cleaning, .system:
-            return false
-        }
-    }
-
-    var needsFullTelemetry: Bool {
-        switch self {
-        case .graphs, .mac, .memory, .storage, .system, .overview:
-            return true
-        case .cpu, .gpu, .network, .cleaning, .fans, .temperatures, .energy:
-            return false
+        case .mac:
+            return battery == nil ? "desktopcomputer" : "laptopcomputer"
+        case .energy:
+            return battery == nil ? symbol : batterySymbolName(battery)
+        default:
+            return symbol
         }
     }
 }
 
 private struct SidebarView: View {
     @Binding var selection: DashboardSection
+    let battery: BatterySnapshot?
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            ForEach(DashboardSection.allCases) { section in
-                Button {
-                    selection = section
-                } label: {
-                    HStack(spacing: 8) {
-                        Label(section.title, systemImage: section.symbol)
-                            .font(.callout)
-                        Spacer(minLength: 0)
+        ScrollView {
+            VStack(alignment: .leading, spacing: 3) {
+                ForEach(DashboardSection.allCases) { section in
+                    Button {
+                        selection = section
+                    } label: {
+                        HStack(spacing: 8) {
+                            Label(section.title, systemImage: section.symbol(battery: battery))
+                                .font(.callout)
+                            Spacer(minLength: 0)
+                        }
+                        .frame(maxWidth: .infinity, minHeight: 29, alignment: .leading)
+                        .padding(.horizontal, 10)
+                        .contentShape(Rectangle())
                     }
-                    .frame(maxWidth: .infinity, minHeight: 32, alignment: .leading)
-                    .padding(.horizontal, 10)
-                    .contentShape(Rectangle())
+                    .buttonStyle(.plain)
+                    .focusable(false)
+                    .foregroundStyle(selection == section ? Color.primary : Color.secondary)
+                    .frame(maxWidth: .infinity)
+                    .background(
+                        selection == section ? Color.accentColor.opacity(0.16) : Color.clear,
+                        in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    )
+                    .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
                 }
-                .buttonStyle(.plain)
-                .foregroundStyle(selection == section ? Color.primary : Color.secondary)
-                .frame(maxWidth: .infinity)
-                .background(
-                    selection == section ? Color.accentColor.opacity(0.16) : Color.clear,
-                    in: RoundedRectangle(cornerRadius: 8, style: .continuous)
-                )
-                .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
             }
-
-            Spacer()
         }
+        .scrollIndicators(.never)
     }
 }
 
@@ -1394,80 +2111,75 @@ private struct TelemetryHistory {
     private let maxSampleCount = 80
 
     mutating func append(_ snapshot: DashboardSnapshot) {
+        guard samples.last.map({ snapshot.date > $0.date }) ?? true else { return }
         samples.append(TelemetrySample(snapshot: snapshot, previous: samples.last))
         if samples.count > maxSampleCount {
             samples.removeFirst(samples.count - maxSampleCount)
         }
     }
 
-    var temperaturePoints: [TelemetryChartPoint] {
-        samples.compactMap { sample in
-            sample.maxTemperature.map { TelemetryChartPoint(date: sample.date, value: $0) }
-        }
+    var temperaturePoints: TelemetryChartData {
+        points(\.maxTemperature)
     }
 
-    var cpuPoints: [TelemetryChartPoint] {
-        samples.compactMap { sample in
-            sample.cpuUsage.map { TelemetryChartPoint(date: sample.date, value: $0) }
-        }
+    var cpuPoints: TelemetryChartData {
+        points(\.cpuUsage)
     }
 
-    var gpuPoints: [TelemetryChartPoint] {
-        samples.compactMap { sample in
-            sample.gpuUsage.map { TelemetryChartPoint(date: sample.date, value: $0) }
-        }
+    var gpuPoints: TelemetryChartData {
+        points(\.gpuUsage)
     }
 
-    var gpuTemperaturePoints: [TelemetryChartPoint] {
-        samples.compactMap { sample in
-            sample.gpuTemperature.map { TelemetryChartPoint(date: sample.date, value: $0) }
-        }
+    var gpuTemperaturePoints: TelemetryChartData {
+        points(\.gpuTemperature)
     }
 
-    var rpmPoints: [TelemetryChartPoint] {
-        samples.compactMap { sample in
-            sample.averageRPM.map { TelemetryChartPoint(date: sample.date, value: $0) }
-        }
+    var rpmPoints: TelemetryChartData {
+        points(\.averageRPM)
     }
 
-    var powerPoints: [TelemetryChartPoint] {
-        samples.compactMap { sample in
-            sample.systemPower.map { TelemetryChartPoint(date: sample.date, value: $0) }
-        }
+    var powerPoints: TelemetryChartData {
+        points(\.systemPower)
     }
 
-    var memoryPoints: [TelemetryChartPoint] {
-        samples.compactMap { sample in
-            sample.memoryUsedRatio.map { TelemetryChartPoint(date: sample.date, value: $0) }
-        }
+    var memoryPoints: TelemetryChartData {
+        points(\.memoryUsedRatio)
     }
 
-    var networkDownPoints: [TelemetryChartPoint] {
-        samples.compactMap { sample in
-            sample.networkDownBps.map { TelemetryChartPoint(date: sample.date, value: $0) }
-        }
+    var networkDownPoints: TelemetryChartData {
+        points(\.networkDownBps)
     }
 
-    var networkUpPoints: [TelemetryChartPoint] {
-        samples.compactMap { sample in
-            sample.networkUpBps.map { TelemetryChartPoint(date: sample.date, value: $0) }
-        }
+    var networkUpPoints: TelemetryChartData {
+        points(\.networkUpBps)
     }
 
-    var diskReadPoints: [TelemetryChartPoint] {
-        samples.compactMap { sample in
-            sample.diskReadBps.map { TelemetryChartPoint(date: sample.date, value: $0) }
-        }
+    var diskReadPoints: TelemetryChartData {
+        points(\.diskReadBps, date: \.diskDate)
     }
 
-    var diskWritePoints: [TelemetryChartPoint] {
-        samples.compactMap { sample in
-            sample.diskWriteBps.map { TelemetryChartPoint(date: sample.date, value: $0) }
-        }
+    var diskWritePoints: TelemetryChartData {
+        points(\.diskWriteBps, date: \.diskDate)
+    }
+
+    var batteryPowerPoints: TelemetryChartData {
+        points(\.batteryPower)
+    }
+
+    var systemLoadPowerPoints: TelemetryChartData {
+        points(\.systemLoadPower)
+    }
+
+    var latest: TelemetrySample? {
+        samples.last
+    }
+
+    private func points(_ value: KeyPath<TelemetrySample, Double?>, date: KeyPath<TelemetrySample, Date> = \.date) -> TelemetryChartData {
+        TelemetryChartSeries.make(samples.map { ($0[keyPath: date], $0[keyPath: value], $0.samplingEpoch) })
     }
 
     var latestMaxTemperature: Double? {
-        temperaturePoints.last?.value
+        samples.last?.maxTemperature
     }
 
     var latestCPUUsage: Double? {
@@ -1487,15 +2199,15 @@ private struct TelemetryHistory {
     }
 
     var latestAverageRPM: Double? {
-        rpmPoints.last?.value
+        samples.last?.averageRPM
     }
 
     var latestSystemPower: Double? {
-        powerPoints.last?.value
+        samples.last?.systemPower
     }
 
     var latestMemoryRatio: Double? {
-        memoryPoints.last?.value
+        memoryPoints.points.last?.value
     }
 
     var latestNetworkDownBps: Double? {
@@ -1521,7 +2233,9 @@ private struct TelemetryHistory {
 
 private struct TelemetrySample: Identifiable {
     let id = UUID()
-    let date = Date()
+    let date: Date
+    let samplingEpoch: UInt64
+    let diskDate: Date
     let maxTemperature: Double?
     let averageRPM: Double?
     let systemPower: Double?
@@ -1541,39 +2255,25 @@ private struct TelemetrySample: Identifiable {
     let networkDownBps: Double?
     let networkUpBps: Double?
     let networkInterfaceRates: [NetworkInterfaceRate]
-
-    init(snapshot: DashboardSnapshot) {
-        maxTemperature = snapshot.sensors?.hottestTemperature.map { Double($0.value) }
-
-        if let fans = snapshot.fans?.fans, !fans.isEmpty {
-            let total = fans.reduce(Double(0)) { $0 + Double(max($1.actualRPM, 0)) }
-            averageRPM = total / Double(fans.count)
-        } else {
-            averageRPM = nil
-        }
-
-        systemPower = snapshot.sensors?.readings.first(where: { $0.sensor.key == "PSTR" }).map {
-            Double($0.value)
-        }
-        memoryUsedRatio = snapshot.telemetry.memory.usedRatio
-        gpuUsage = snapshot.telemetry.gpu?.utilizationRatio
-        gpuTemperature = snapshot.sensors?.readings(type: .temperature, group: .gpu).map { Double($0.value) }.max()
-        cpuCores = snapshot.telemetry.cpu.cores
-        cpuUsage = nil
-        coreUsages = []
-        diskReadBytes = snapshot.telemetry.diskIO.readBytes
-        diskWrittenBytes = snapshot.telemetry.diskIO.writtenBytes
-        diskReadBps = nil
-        diskWriteBps = nil
-        networkReceivedBytes = snapshot.telemetry.network.totalReceivedBytes
-        networkSentBytes = snapshot.telemetry.network.totalSentBytes
-        networkInterfaces = snapshot.telemetry.network.interfaces
-        networkDownBps = nil
-        networkUpBps = nil
-        networkInterfaceRates = []
-    }
+    let memory: MemorySnapshot
+    let cpuUserRatio: Double?
+    let cpuSystemRatio: Double?
+    let pageInBps: Double?
+    let pageOutBps: Double?
+    let swapInBps: Double?
+    let swapOutBps: Double?
+    let batteryPower: Double?
+    let systemLoadPower: Double?
+    let systemPowerIn: Double?
 
     init(snapshot: DashboardSnapshot, previous: TelemetrySample?) {
+        memory = snapshot.telemetry.memory
+        batteryPower = snapshot.telemetry.battery?.batteryPowerWatts
+        systemLoadPower = snapshot.telemetry.battery?.systemLoadWatts
+        systemPowerIn = snapshot.telemetry.battery?.systemPowerInWatts
+        date = snapshot.date
+        samplingEpoch = snapshot.samplingEpoch
+        diskDate = snapshot.diskDate
         maxTemperature = snapshot.sensors?.hottestTemperature.map { Double($0.value) }
 
         if let fans = snapshot.fans?.fans, !fans.isEmpty {
@@ -1586,7 +2286,7 @@ private struct TelemetrySample: Identifiable {
         systemPower = snapshot.sensors?.readings.first(where: { $0.sensor.key == "PSTR" }).map {
             Double($0.value)
         }
-        memoryUsedRatio = snapshot.telemetry.memory.usedRatio
+        memoryUsedRatio = snapshot.telemetry.memory.isAvailable ? snapshot.telemetry.memory.usedRatio : nil
         gpuUsage = snapshot.telemetry.gpu?.utilizationRatio
         gpuTemperature = snapshot.sensors?.readings(type: .temperature, group: .gpu).map { Double($0.value) }.max()
         cpuCores = snapshot.telemetry.cpu.cores
@@ -1596,23 +2296,26 @@ private struct TelemetrySample: Identifiable {
         networkSentBytes = snapshot.telemetry.network.totalSentBytes
         networkInterfaces = snapshot.telemetry.network.interfaces
 
-        if let previous {
+        if let previous, previous.samplingEpoch == samplingEpoch,
+           TelemetryContinuity.isContinuous(from: previous.date, to: date) {
             let interval = max(date.timeIntervalSince(previous.date), 0.1)
             let cpu = computeCPUUsage(current: cpuCores, previous: previous.cpuCores)
             cpuUsage = cpu.total
             coreUsages = cpu.cores
-
-            if diskReadBytes >= previous.diskReadBytes {
-                diskReadBps = Double(diskReadBytes - previous.diskReadBytes) / interval
-            } else {
-                diskReadBps = nil
+            let split = computeCPUSplit(current: snapshot.telemetry.cpu, previous: previous.cpuCores)
+            cpuUserRatio = split?.user
+            cpuSystemRatio = split?.system
+            let pageRate = { (current: UInt64, old: UInt64) -> Double? in
+                current >= old ? Double(current - old) / interval : nil
             }
+            let currentMemory = snapshot.telemetry.memory
+            pageInBps = pageRate(currentMemory.pageInBytes, previous.memory.pageInBytes)
+            pageOutBps = pageRate(currentMemory.pageOutBytes, previous.memory.pageOutBytes)
+            swapInBps = pageRate(currentMemory.swapInBytes, previous.memory.swapInBytes)
+            swapOutBps = pageRate(currentMemory.swapOutBytes, previous.memory.swapOutBytes)
 
-            if diskWrittenBytes >= previous.diskWrittenBytes {
-                diskWriteBps = Double(diskWrittenBytes - previous.diskWrittenBytes) / interval
-            } else {
-                diskWriteBps = nil
-            }
+            diskReadBps = snapshot.diskReadBps
+            diskWriteBps = snapshot.diskWriteBps
 
             if networkReceivedBytes >= previous.networkReceivedBytes {
                 networkDownBps = Double(networkReceivedBytes - previous.networkReceivedBytes) / interval
@@ -1634,19 +2337,19 @@ private struct TelemetrySample: Identifiable {
         } else {
             cpuUsage = nil
             coreUsages = []
-            diskReadBps = nil
-            diskWriteBps = nil
+            cpuUserRatio = nil
+            cpuSystemRatio = nil
+            pageInBps = nil
+            pageOutBps = nil
+            swapInBps = nil
+            swapOutBps = nil
+            diskReadBps = snapshot.diskReadBps
+            diskWriteBps = snapshot.diskWriteBps
             networkDownBps = nil
             networkUpBps = nil
             networkInterfaceRates = []
         }
     }
-}
-
-private struct TelemetryChartPoint: Identifiable {
-    let id = UUID()
-    let date: Date
-    let value: Double
 }
 
 private struct CPUCoreUsage: Identifiable {
@@ -1703,6 +2406,22 @@ private func computeCPUUsage(
 
     let total = totalDeltaTotal > 0 ? min(max(Double(activeDeltaTotal) / Double(totalDeltaTotal), 0), 1) : nil
     return (total, usages)
+}
+
+private func computeCPUSplit(current: CPUSnapshot, previous: [CPUCoreSnapshot]) -> (user: Double, system: Double)? {
+    let previousUser = previous.reduce(UInt64(0)) { $0 + $1.userTicks + $1.niceTicks }
+    let previousSystem = previous.reduce(UInt64(0)) { $0 + $1.systemTicks }
+    let previousTotal = previous.reduce(UInt64(0)) { $0 + $1.totalTicks }
+    guard current.totalUserTicks >= previousUser,
+          current.totalSystemTicks >= previousSystem,
+          current.totalTicks > previousTotal else {
+        return nil
+    }
+    let total = Double(current.totalTicks - previousTotal)
+    return (
+        min(max(Double(current.totalUserTicks - previousUser) / total, 0), 1),
+        min(max(Double(current.totalSystemTicks - previousSystem) / total, 0), 1)
+    )
 }
 
 private func computeNetworkInterfaceRates(
@@ -1827,18 +2546,7 @@ private struct AppMark: View {
     let size: CGFloat
 
     var body: some View {
-        ZStack {
-            RoundedRectangle(cornerRadius: size * 0.22, style: .continuous)
-                .fill(.regularMaterial)
-                .overlay(
-                    RoundedRectangle(cornerRadius: size * 0.22, style: .continuous)
-                        .stroke(Color(nsColor: .separatorColor), lineWidth: 1)
-                )
-            Image(systemName: "fanblades.fill")
-                .font(.system(size: size * 0.48, weight: .semibold))
-                .foregroundStyle(.tint)
-        }
-        .frame(width: size, height: size)
+        AppIconView(size: size)
     }
 }
 
@@ -1867,9 +2575,214 @@ private struct MetricView: View {
 
             Spacer(minLength: 0)
         }
+        .frame(minHeight: 50)
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+}
+
+private struct BatteryMetricView: View {
+    let battery: BatterySnapshot
+
+    private var detail: String {
+        if battery.isCharging {
+            return battery.timeToFullMinutes.map { "llena en \(formatBatteryMinutes($0))" } ?? "cargando"
+        }
+        if battery.externalConnected {
+            return battery.isCharged || battery.percent >= 100 ? "cargada" : "carga en pausa"
+        }
+        return battery.timeToEmptyMinutes.map { "quedan \(formatBatteryMinutes($0))" } ?? "con batería"
+    }
+
+    var body: some View {
+        HStack(spacing: 10) {
+            BatteryGlyph(battery: battery, height: 13)
+                .frame(width: 30)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Batería")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                HStack(alignment: .firstTextBaseline, spacing: 5) {
+                    Text("\(battery.percent)%")
+                        .font(.system(size: 17, weight: .semibold))
+                    Text(detail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .lineLimit(1)
+                .minimumScaleFactor(0.75)
+            }
+
+            Spacer(minLength: 0)
+        }
+        .frame(minHeight: 50)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .contentShape(Rectangle())
+        .help("Abrir Energía")
+    }
+}
+
+private struct MaintenanceReviewPanel: View {
+    let items: [MaintenanceReviewItem]
+
+    private var issues: [MaintenanceReviewItem] {
+        items.filter { $0.status >= .warning }
+    }
+
+    var body: some View {
+        SectionPanel(title: "Revisión de mantenimiento", symbol: "checklist") {
+            Text(issues.isEmpty
+                 ? "Todo en orden: \(items.count) comprobaciones sin avisos."
+                 : "\(issues.count) \(issues.count == 1 ? "punto necesita" : "puntos necesitan") atención.")
+                .font(.callout)
+                .foregroundStyle(issues.isEmpty ? Color.secondary : Color.orange)
+
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 260), spacing: 10, alignment: .top)], alignment: .leading, spacing: 8) {
+                ForEach(items.sorted { $0.status > $1.status }) { item in
+                    HStack(alignment: .top, spacing: 8) {
+                        Image(systemName: symbol(item.status))
+                            .foregroundStyle(tint(item.status))
+                            .frame(width: 16)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(item.title)
+                                .font(.caption.weight(.semibold))
+                            Text(item.detail)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        Spacer(minLength: 0)
+                    }
+                }
+            }
+        }
+    }
+
+    private func symbol(_ status: MaintenanceReviewItem.Status) -> String {
+        switch status {
+        case .ok: return "checkmark.circle.fill"
+        case .info: return "info.circle.fill"
+        case .warning: return "exclamationmark.triangle.fill"
+        case .critical: return "xmark.octagon.fill"
+        }
+    }
+
+    private func tint(_ status: MaintenanceReviewItem.Status) -> Color {
+        switch status {
+        case .ok: return .green
+        case .info: return .blue
+        case .warning: return .orange
+        case .critical: return .red
+        }
+    }
+}
+
+private struct EventTimelineView: View {
+    let events: [MaintenanceEvent]
+
+    private var groups: [(day: Date, events: [MaintenanceEvent])] {
+        let calendar = Calendar.current
+        let grouped = Dictionary(grouping: events) { calendar.startOfDay(for: $0.date) }
+        return grouped.keys.sorted(by: >).map { ($0, grouped[$0]?.sorted { $0.date > $1.date } ?? []) }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            ForEach(groups, id: \.day) { group in
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(dayTitle(group.day))
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    ForEach(group.events) { event in
+                        HStack(alignment: .top, spacing: 10) {
+                            Image(systemName: symbol(event.category))
+                                .foregroundStyle(tint(event.severity))
+                                .frame(width: 18)
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(event.title)
+                                    .font(.callout)
+                                if let detail = event.detail, !detail.isEmpty {
+                                    Text(detail)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                }
+                            }
+                            Spacer()
+                            Text(event.date.formatted(date: .omitted, time: .shortened))
+                                .font(.caption.monospacedDigit())
+                                .foregroundStyle(.secondary)
+                        }
+                        .padding(.vertical, 6)
+                        .padding(.horizontal, 10)
+                        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    }
+                }
+            }
+        }
+    }
+
+    private func dayTitle(_ day: Date) -> String {
+        let calendar = Calendar.current
+        if calendar.isDateInToday(day) { return "Hoy" }
+        if calendar.isDateInYesterday(day) { return "Ayer" }
+        return day.formatted(date: .complete, time: .omitted).capitalized
+    }
+
+    private func symbol(_ category: MaintenanceEvent.Category) -> String {
+        switch category {
+        case .alert: return "bell.badge"
+        case .fans: return "fanblades"
+        case .power: return "powerplug"
+        case .thermal: return "thermometer.medium"
+        case .system: return "power"
+        }
+    }
+
+    private func tint(_ severity: MaintenanceEvent.Severity) -> Color {
+        switch severity {
+        case .info: return .accentColor
+        case .warning: return .orange
+        case .critical: return .red
+        }
+    }
+}
+
+private struct NetworkMetricView: View {
+    let up: Double?
+    let down: Double?
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "network")
+                .font(.system(size: 18, weight: .medium))
+                .foregroundStyle(.tint)
+                .frame(width: 26)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Red").font(.caption).foregroundStyle(.secondary)
+                rateRow(symbol: "arrow.up", rate: up, color: .green)
+                rateRow(symbol: "arrow.down", rate: down, color: .red)
+            }
+            Spacer(minLength: 0)
+        }
+        .frame(minHeight: 50)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    private func rateRow(symbol: String, rate: Double?, color: Color) -> some View {
+        HStack(spacing: 5) {
+            Image(systemName: symbol).foregroundStyle(color).font(.caption)
+            Text(rate.map(formatRate) ?? "--")
+                .font(.system(size: 14, weight: .semibold).monospacedDigit())
+                .lineLimit(1)
+                .minimumScaleFactor(0.75)
+        }
     }
 }
 
@@ -1942,10 +2855,11 @@ private struct SparklineChartView: View {
     let value: String
     let unit: String
     let symbol: String
-    let points: [TelemetryChartPoint]
+    let points: TelemetryChartData
+    var footnote: String? = nil
 
     private var domain: ClosedRange<Double> {
-        let values = points.map(\.value)
+        let values = points.points.map(\.value)
         guard let minValue = values.min(), let maxValue = values.max() else {
             return 0...1
         }
@@ -1955,6 +2869,7 @@ private struct SparklineChartView: View {
     }
 
     var body: some View {
+        let displayPoints = points.displayPoints(baseline: domain.lowerBound)
         VStack(alignment: .leading, spacing: 8) {
             HStack(alignment: .firstTextBaseline) {
                 Label(title, systemImage: symbol)
@@ -1971,34 +2886,98 @@ private struct SparklineChartView: View {
                 }
             }
 
-            Chart(points) { point in
-                LineMark(
-                    x: .value("Tiempo", point.date),
-                    y: .value(title, point.value)
-                )
-                .interpolationMethod(.catmullRom)
-                .lineStyle(StrokeStyle(lineWidth: 2.2, lineCap: .round, lineJoin: .round))
-                .foregroundStyle(Color.accentColor)
+            Chart {
+                ForEach(displayPoints) { point in
+                    LineMark(
+                        x: .value("Tiempo", point.date),
+                        y: .value(title, point.value)
+                    )
+                    .interpolationMethod(.linear)
+                    .lineStyle(StrokeStyle(lineWidth: 2.2, lineCap: .round, lineJoin: .round))
+                    .foregroundStyle(Color.accentColor)
+                    .accessibilityLabel(point.isMeasurement ? title : "Pausa de medición")
+                    .accessibilityValue(point.isMeasurement ? String(point.value) : "Sin medición real")
+                    if displayPoints.count == 1 {
+                        PointMark(x: .value("Tiempo", point.date), y: .value(title, point.value))
+                            .symbolSize(12)
+                            .foregroundStyle(Color.accentColor)
+                    }
+                }
+                if displayPoints.isEmpty {
+                    RuleMark(y: .value(title, domain.lowerBound))
+                        .lineStyle(StrokeStyle(lineWidth: 2.2, lineCap: .round))
+                        .foregroundStyle(Color.accentColor)
+                        .accessibilityLabel("Sin medición real")
+                }
             }
             .chartXAxis(.hidden)
             .chartYAxis(.hidden)
+            .chartLegend(.hidden)
             .chartYScale(domain: domain)
             .frame(height: 74)
+            .animation(.easeInOut(duration: 0.35), value: points.points.last?.date)
+
+            if let footnote {
+                Text(footnote)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
         }
         .padding(10)
         .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 }
 
+private struct ResponsiveChartGrid: View {
+    let charts: [SparklineChartView]
+    @State private var availableWidth: CGFloat = 0
+
+    private var columnCount: Int {
+        min(3, max(1, Int((availableWidth + 12) / 232)))
+    }
+
+    var body: some View {
+        VStack(spacing: 12) {
+            ForEach(Array(stride(from: 0, to: charts.count, by: columnCount)), id: \.self) { start in
+                HStack(spacing: 12) {
+                    ForEach(start..<min(start + columnCount, charts.count), id: \.self) { index in
+                        charts[index].frame(maxWidth: .infinity)
+                    }
+                }
+            }
+        }
+        .background {
+            GeometryReader { geometry in
+                Color.clear
+                    .onAppear { availableWidth = geometry.size.width }
+                    .onChange(of: geometry.size.width) { availableWidth = $0 }
+            }
+        }
+    }
+}
+
 private struct CPUCoreUsageGridView: View {
     let usages: [CPUCoreUsage]
+    let cpu: CPUSnapshot
+
+    private func label(for index: Int) -> String {
+        switch cpu.coreKind(at: index) {
+        case .efficiency?:
+            return "Eficiencia \(index + 1)"
+        case .performance?:
+            return "Rendimiento \(index - (cpu.efficiencyCoreCount ?? 0) + 1)"
+        case nil:
+            return "Núcleo \(index + 1)"
+        }
+    }
 
     var body: some View {
         LazyVGrid(columns: [GridItem(.adaptive(minimum: 120), spacing: 10)], spacing: 10) {
             ForEach(usages.sorted { $0.index < $1.index }) { core in
                 VStack(alignment: .leading, spacing: 6) {
                     HStack {
-                        Text("Nucleo \(core.index + 1)")
+                        Text(label(for: core.index))
                             .font(.caption)
                             .foregroundStyle(.secondary)
                         Spacer()
@@ -2017,41 +2996,326 @@ private struct CPUCoreUsageGridView: View {
     }
 }
 
-private struct NetworkInterfaceRateView: View {
+private struct NetworkInterfaceDetailList: View {
+    let interfaces: [NetworkInterfaceSnapshot]
     let rates: [NetworkInterfaceRate]
+    let primaryName: String?
+
+    @State private var showsSystemTunnels = false
+
+    private var ordered: [NetworkInterfaceSnapshot] {
+        interfaces.sorted { lhs, rhs in
+            if (lhs.name == primaryName) != (rhs.name == primaryName) { return lhs.name == primaryName }
+            if (lhs.kind == .vpn) != (rhs.kind == .vpn) { return rhs.kind == .vpn }
+            return (lhs.receivedBytes + lhs.sentBytes) > (rhs.receivedBytes + rhs.sentBytes)
+        }
+    }
+
+    /// Los túneles internos de macOS (iCloud, Continuidad, AirDrop) solo tienen direcciones link-local.
+    private func isSystemTunnel(_ interface: NetworkInterfaceSnapshot) -> Bool {
+        interface.kind == .vpn
+            && interface.name != primaryName
+            && interface.ipv4Addresses.isEmpty
+            && interface.ipv6Addresses.isEmpty
+    }
 
     var body: some View {
+        let visible = ordered.filter { !isSystemTunnel($0) }
+        let tunnels = ordered.filter(isSystemTunnel)
+
         VStack(alignment: .leading, spacing: 8) {
-            if rates.isEmpty {
-                EmptyStateView(message: "Calculando velocidad por interfaz...")
-            } else {
-                ForEach(rates) { rate in
-                    HStack(spacing: 10) {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(rate.displayName)
-                                .font(.callout.weight(.medium))
-                            Text(rate.name)
-                                .font(.caption)
-                                .foregroundStyle(.tertiary)
+            if interfaces.isEmpty {
+                EmptyStateView(message: "Sin interfaces activas.")
+            }
+            ForEach(visible) { interface in
+                interfaceRow(interface, title: interface.displayName)
+            }
+            if !tunnels.isEmpty {
+                DisclosureGroup(isExpanded: $showsSystemTunnels) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        ForEach(tunnels) { interface in
+                            interfaceRow(interface, title: "Túnel del sistema")
                         }
-                        .frame(width: 100, alignment: .leading)
-
-                        Spacer()
-
-                        Label(formatRate(rate.receivedBps), systemImage: "arrow.down")
-                            .font(.system(.callout, design: .rounded).monospacedDigit())
-                            .frame(width: 120, alignment: .trailing)
-
-                        Label(formatRate(rate.sentBps), systemImage: "arrow.up")
-                            .font(.system(.callout, design: .rounded).monospacedDigit())
-                            .frame(width: 120, alignment: .trailing)
                     }
-                    .padding(10)
-                    .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    .padding(.top, 6)
+                } label: {
+                    Text("Túneles internos de macOS (\(tunnels.count))")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
                 }
             }
         }
     }
+
+    private func interfaceRow(_ interface: NetworkInterfaceSnapshot, title: String) -> some View {
+        let rate = rates.first { $0.name == interface.name }
+        return VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 10) {
+                        Image(systemName: symbol(for: interface.kind))
+                            .foregroundStyle(.tint)
+                            .frame(width: 18)
+                        VStack(alignment: .leading, spacing: 1) {
+                            HStack(spacing: 6) {
+                                Text(title)
+                                    .font(.callout.weight(.medium))
+                                if interface.name == primaryName {
+                                    Text("principal")
+                                        .font(.caption2.weight(.semibold))
+                                        .padding(.horizontal, 6)
+                                        .padding(.vertical, 1)
+                                        .background(Color.accentColor.opacity(0.18), in: Capsule())
+                                }
+                            }
+                            Text(interface.name)
+                                .font(.caption)
+                                .foregroundStyle(.tertiary)
+                        }
+                        Spacer()
+                        Label(rate.map { formatRate($0.receivedBps) } ?? "--", systemImage: "arrow.down")
+                            .font(.system(.callout, design: .rounded).monospacedDigit())
+                            .frame(width: 110, alignment: .trailing)
+                        Label(rate.map { formatRate($0.sentBps) } ?? "--", systemImage: "arrow.up")
+                            .font(.system(.callout, design: .rounded).monospacedDigit())
+                            .frame(width: 110, alignment: .trailing)
+                    }
+
+                    Text(detailLine(interface))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(10)
+                .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
+    private func detailLine(_ interface: NetworkInterfaceSnapshot) -> String {
+        var parts: [String] = []
+        if let ipv4 = interface.ipv4Addresses.first { parts.append("IP \(ipv4)") }
+        if let mac = interface.macAddress { parts.append("MAC \(mac)") }
+        if let speed = interface.linkSpeedBitsPerSecond, interface.kind != .vpn {
+            parts.append(speed >= 1_000_000_000
+                ? String(format: "Enlace %.1f Gb/s", Double(speed) / 1_000_000_000)
+                : "Enlace \(speed / 1_000_000) Mb/s")
+        }
+        if let mtu = interface.mtu { parts.append("MTU \(mtu)") }
+        parts.append("Total ↓ \(formatBytes(interface.receivedBytes)) ↑ \(formatBytes(interface.sentBytes))")
+        let errors = interface.inputErrors + interface.outputErrors
+        if errors > 0 { parts.append("\(errors) errores") }
+        return parts.joined(separator: " · ")
+    }
+
+    private func symbol(for kind: NetworkInterfaceKind) -> String {
+        switch kind {
+        case .wifi: return "wifi"
+        case .ethernet: return "cable.connector"
+        case .vpn: return "lock.shield"
+        case .other: return "network"
+        }
+    }
+}
+
+private struct AppNetworkUsageList: View {
+    enum Mode: String, CaseIterable, Identifiable {
+        case now = "Ahora"
+        case total = "Acumulado"
+        var id: String { rawValue }
+    }
+
+    let usage: [AppNetworkUsage]
+    @State private var mode: Mode = .now
+
+    private static var iconCache: [String: NSImage] = [:]
+
+    private var isMeasuring: Bool {
+        !usage.isEmpty && usage.allSatisfy { $0.receivedBps == nil }
+    }
+
+    private var rows: [AppNetworkUsage] {
+        switch mode {
+        case .now:
+            return Array(usage.filter { $0.currentBps > 0 }.sorted { $0.currentBps > $1.currentBps }.prefix(10))
+        case .total:
+            return Array(usage.sorted { $0.totalBytes > $1.totalBytes }.prefix(10))
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Picker("", selection: $mode) {
+                ForEach(Mode.allCases) { Text($0.rawValue).tag($0) }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .frame(maxWidth: 240)
+
+            if usage.isEmpty {
+                EmptyStateView(message: "Leyendo el tráfico de las aplicaciones…")
+            } else if mode == .now && isMeasuring {
+                EmptyStateView(message: "Midiendo…")
+            } else if rows.isEmpty {
+                EmptyStateView(message: "Ninguna aplicación está usando la red ahora mismo.")
+            } else {
+                ForEach(rows) { entry in
+                    row(entry)
+                }
+            }
+        }
+    }
+
+    private func row(_ entry: AppNetworkUsage) -> some View {
+        HStack(spacing: 10) {
+            icon(for: entry)
+                .frame(width: 22, height: 22)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(entry.name)
+                    .font(.callout.weight(.medium))
+                    .lineLimit(1)
+                Text(subtitle(entry))
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+                    .lineLimit(1)
+            }
+            Spacer()
+            if mode == .now {
+                Label(formatRate(entry.receivedBps ?? 0), systemImage: "arrow.down")
+                    .frame(width: 110, alignment: .trailing)
+                Label(formatRate(entry.sentBps ?? 0), systemImage: "arrow.up")
+                    .frame(width: 110, alignment: .trailing)
+            } else {
+                Label(formatBytes(entry.totalReceivedBytes), systemImage: "arrow.down")
+                    .frame(width: 110, alignment: .trailing)
+                Label(formatBytes(entry.totalSentBytes), systemImage: "arrow.up")
+                    .frame(width: 110, alignment: .trailing)
+            }
+        }
+        .font(.system(.callout, design: .rounded).monospacedDigit())
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .help(entry.appPath ?? entry.name)
+    }
+
+    private func subtitle(_ entry: AppNetworkUsage) -> String {
+        let kind = entry.appPath == nil ? "Proceso del sistema" : "Aplicación"
+        return entry.processCount > 1 ? "\(kind) · \(entry.processCount) procesos" : kind
+    }
+
+    @ViewBuilder
+    private func icon(for entry: AppNetworkUsage) -> some View {
+        if let path = entry.appPath {
+            Image(nsImage: Self.cachedIcon(path))
+                .resizable()
+                .interpolation(.high)
+        } else {
+            Image(systemName: "gearshape.2")
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private static func cachedIcon(_ path: String) -> NSImage {
+        if let icon = iconCache[path] { return icon }
+        let icon = NSWorkspace.shared.icon(forFile: path)
+        iconCache[path] = icon
+        return icon
+    }
+}
+
+private struct VolumeUsageBar: View {
+    let volume: VolumeSnapshot
+
+    private var tint: Color {
+        let free = 1 - volume.usedRatio
+        return free < 0.05 ? .red : free < 0.12 ? .orange : .accentColor
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            ProgressView(value: volume.usedRatio, total: 1)
+                .tint(tint)
+            HStack {
+                Text("\(formatBytes(volume.usedBytes)) usados")
+                Spacer()
+                Text("\(formatBytes(volume.availableBytes)) libres de \(formatBytes(volume.totalBytes))")
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        }
+    }
+}
+
+private struct VolumeRowView: View {
+    let volume: VolumeSnapshot
+    let details: StorageDeviceDetails?
+    let onEject: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 10) {
+                Image(systemName: volume.isInternal ? "internaldrive" : "externaldrive")
+                    .foregroundStyle(.tint)
+                    .frame(width: 18)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(volume.name)
+                        .font(.callout.weight(.medium))
+                    Text(subtitle)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                Spacer()
+                if volume.isEjectable && !volume.isRootVolume {
+                    Button {
+                        onEject()
+                    } label: {
+                        Label("Expulsar", systemImage: "eject")
+                    }
+                    .controlSize(.small)
+                }
+            }
+            VolumeUsageBar(volume: volume)
+        }
+        .padding(10)
+        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
+    private var subtitle: String {
+        var parts: [String] = [volume.isRootVolume ? "Arranque" : volume.isInternal ? "Interno" : "Externo"]
+        if let format = volume.format { parts.append(format) }
+        if let media = details?.mediaName { parts.append(media) }
+        if let smart = details?.smartStatus, !volume.isRootVolume { parts.append("SMART \(localizedSMARTStatus(smart))") }
+        if volume.isReadOnly && !volume.isRootVolume { parts.append("solo lectura") }
+        parts.append(volume.path)
+        return parts.joined(separator: " · ")
+    }
+}
+
+private func localizedSMARTStatus(_ status: String) -> String {
+    switch status {
+    case "Verified": return "Correcto"
+    case "Failing": return "Fallando"
+    case "Not Supported": return "No disponible"
+    default: return status
+    }
+}
+
+private func latencyTint(_ milliseconds: Double?) -> Color {
+    guard let milliseconds else { return .secondary }
+    if milliseconds >= 150 { return .red }
+    if milliseconds >= 60 { return .orange }
+    return .green
+}
+
+private func wifiSignalSymbol(_ rssi: Int?) -> String {
+    guard let rssi else { return "wifi" }
+    return rssi >= -72 ? "wifi" : "wifi.exclamationmark"
+}
+
+private func wifiSignalTint(_ rssi: Int?) -> Color {
+    guard let rssi else { return .secondary }
+    if rssi >= -60 { return .green }
+    if rssi >= -72 { return .yellow }
+    return .orange
 }
 
 private struct GPUDemandListView: View {
@@ -2233,7 +3497,6 @@ private struct FanRowView: View {
         }
         .padding(12)
         .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-        .animation(.easeInOut(duration: 0.55), value: reading.actualRPM)
     }
 }
 
@@ -2311,9 +3574,12 @@ private struct InfoRow: View {
         HStack {
             Text(title)
                 .foregroundStyle(.secondary)
-                .frame(width: 110, alignment: .leading)
+                .frame(width: 130, alignment: .leading)
             Text(value)
                 .lineLimit(1)
+                .truncationMode(.middle)
+                .textSelection(.enabled)
+                .help(value)
             Spacer()
         }
         .font(.callout)
@@ -2354,6 +3620,7 @@ extension Notification.Name {
     static let fanManualControlDidSucceed = Notification.Name("fanManualControlDidSucceed")
     static let cleanModeStartRequested = Notification.Name("cleanModeStartRequested")
     static let diagnosticsSectionRequested = Notification.Name("diagnosticsSectionRequested")
+    static let fanAutomaticControlDidSucceed = Notification.Name("fanAutomaticControlDidSucceed")
     static let preferencesRequested = Notification.Name("preferencesRequested")
 }
 
@@ -2411,6 +3678,15 @@ private struct OverviewVerdict {
                 title: "CPU muy ocupada",
                 detail: "Uso de CPU al \(formatPercent(cpuUsage)). Mira qué proceso está cargando más abajo.",
                 symbol: "cpu",
+                tint: .orange
+            )
+        }
+
+        if !snapshot.sensorStatus.isCurrent || !snapshot.fanStatus.isCurrent || !snapshot.telemetry.memory.isAvailable || pressure < 0 {
+            return OverviewVerdict(
+                title: "Lecturas incompletas",
+                detail: "Hay métricas del sistema sin lectura actual fiable.",
+                symbol: "exclamationmark.triangle",
                 tint: .orange
             )
         }
@@ -2591,6 +3867,7 @@ private func temperatureTint(_ value: Double?) -> Color {
 }
 
 private func memoryPressureTint(_ level: Int) -> Color {
+    if level < 0 { return .secondary }
     switch level {
     case 0...1:
         return .green

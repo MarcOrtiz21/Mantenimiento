@@ -1,5 +1,25 @@
 import Foundation
 
+struct AppNetworkUsage: Identifiable, Equatable {
+    let id: String
+    let name: String
+    let appPath: String?
+    let receivedBps: Double?
+    let sentBps: Double?
+    let totalReceivedBytes: UInt64
+    let totalSentBytes: UInt64
+    let processCount: Int
+
+    var currentBps: Double { (receivedBps ?? 0) + (sentBps ?? 0) }
+    var totalBytes: UInt64 { totalReceivedBytes + totalSentBytes }
+}
+
+private extension UInt64 {
+    func subtractingClamped(_ other: UInt64) -> UInt64 {
+        self >= other ? self - other : 0
+    }
+}
+
 final class ProcessDemandSampler {
     static let shared = ProcessDemandSampler()
 
@@ -14,6 +34,10 @@ final class ProcessDemandSampler {
     private var previousNetworkDate: Date?
     private var previousGPUTimes: [String: UInt64] = [:]
     private var previousGPUDate: Date?
+    private let appNetworkLock = NSLock()
+    private var previousAppNetworkCounters: [String: NetworkCounters] = [:]
+    private var previousAppNetworkDate: Date?
+    private var ownerCache: [Int32: ProcessOwner] = [:]
 
     private init() {}
 
@@ -51,6 +75,7 @@ final class ProcessDemandSampler {
             timeout: 1.2
         )
         let currentDate = Date()
+        guard !output.isEmpty else { return [MenuDemandEntry(name: "Estado", detail: "Lectura TCP no disponible")] }
         let current = parseNetworkCounters(output)
         defer {
             previousNetworkCounters = current
@@ -93,6 +118,105 @@ final class ProcessDemandSampler {
         .sorted { $0.sortValue > $1.sortValue }
     }
 
+    /// Tráfico TCP y UDP agrupado por aplicación; los helpers se suman a la app que los contiene.
+    func appNetworkUsage() -> [AppNetworkUsage] {
+        appNetworkLock.lock()
+        defer { appNetworkLock.unlock() }
+
+        let output = ExternalCommandRunner.capture(
+            executable: "/usr/bin/nettop",
+            arguments: ["-P", "-L", "1", "-x", "-n"],
+            timeout: 1.5
+        )
+        let currentDate = Date()
+        let current = parseNetworkCounters(output)
+        guard !current.isEmpty else { return [] }
+        let interval = previousAppNetworkDate.map { max(currentDate.timeIntervalSince($0), 0.1) }
+
+        struct Accumulator {
+            var name: String
+            var appPath: String?
+            var receivedRate: Double = 0
+            var sentRate: Double = 0
+            var totalReceived: UInt64 = 0
+            var totalSent: UInt64 = 0
+            var processes = 0
+            var hasRate = false
+        }
+        var groups: [String: Accumulator] = [:]
+        for (key, counters) in current where counters.received > 0 || counters.sent > 0 {
+            let owner = processOwner(forNettopKey: key)
+            var group = groups[owner.id] ?? Accumulator(name: owner.name, appPath: owner.appPath)
+            group.totalReceived += counters.received
+            group.totalSent += counters.sent
+            group.processes += 1
+            if let interval, let old = previousAppNetworkCounters[key] {
+                group.hasRate = true
+                group.receivedRate += Double(counters.received.subtractingClamped(old.received)) / interval
+                group.sentRate += Double(counters.sent.subtractingClamped(old.sent)) / interval
+            }
+            groups[owner.id] = group
+        }
+
+        previousAppNetworkCounters = current
+        previousAppNetworkDate = currentDate
+        let livePIDs = Set(current.keys.compactMap(Self.pid(fromNettopKey:)))
+        ownerCache = ownerCache.filter { livePIDs.contains($0.key) }
+
+        return groups.map { id, group in
+            AppNetworkUsage(
+                id: id,
+                name: group.name,
+                appPath: group.appPath,
+                receivedBps: group.hasRate ? group.receivedRate : nil,
+                sentBps: group.hasRate ? group.sentRate : nil,
+                totalReceivedBytes: group.totalReceived,
+                totalSentBytes: group.totalSent,
+                processCount: group.processes
+            )
+        }
+    }
+
+    private struct ProcessOwner {
+        let id: String
+        let name: String
+        let appPath: String?
+    }
+
+    private func processOwner(forNettopKey key: String) -> ProcessOwner {
+        let fallbackName = processDisplayName(key)
+        guard let pid = Self.pid(fromNettopKey: key) else {
+            return ProcessOwner(id: fallbackName, name: fallbackName, appPath: nil)
+        }
+        if let cached = ownerCache[pid] {
+            return cached
+        }
+
+        var buffer = [CChar](repeating: 0, count: 4 * Int(MAXPATHLEN))
+        let length = proc_pidpath(pid, &buffer, UInt32(buffer.count))
+        let owner: ProcessOwner
+        if length > 0 {
+            let path = String(cString: buffer)
+            if let range = path.range(of: ".app/") {
+                let appPath = String(path[..<range.lowerBound]) + ".app"
+                let name = (FileManager.default.displayName(atPath: appPath) as NSString).deletingPathExtension
+                owner = ProcessOwner(id: appPath, name: name, appPath: appPath)
+            } else {
+                let name = URL(fileURLWithPath: path).lastPathComponent
+                owner = ProcessOwner(id: name, name: name, appPath: nil)
+            }
+        } else {
+            owner = ProcessOwner(id: fallbackName, name: fallbackName, appPath: nil)
+        }
+        ownerCache[pid] = owner
+        return owner
+    }
+
+    private static func pid(fromNettopKey key: String) -> Int32? {
+        guard let dot = key.lastIndex(of: ".") else { return nil }
+        return Int32(key[key.index(after: dot)...])
+    }
+
     func gpuEntries() -> [MenuDemandEntry] {
         gpuLock.lock()
         defer { gpuLock.unlock() }
@@ -130,7 +254,7 @@ final class ProcessDemandSampler {
             let ratio = min(max(Double(delta) / 1_000_000_000 / interval, 0), 1)
             return MenuDemandEntry(
                 name: name,
-                detail: String(format: "%.1f%% GPU", ratio * 100),
+                detail: String(format: "≈ %.1f%% GPU", ratio * 100),
                 sortValue: ratio
             )
         }

@@ -29,6 +29,12 @@ public struct FanSnapshot: Codable {
     public let fans: [FanReading]
     public let modeKeyFormat: String?
     public let forceTestAvailable: Bool
+    public let forceTestRawValue: UInt8?
+
+    public var isAutomaticControlConfirmed: Bool {
+        !fans.isEmpty && fans.allSatisfy { $0.mode == .automatic || $0.mode == .system }
+            && (!forceTestAvailable || forceTestRawValue == 0)
+    }
 }
 
 public enum FanControlStrategy: String, Codable {
@@ -37,10 +43,16 @@ public enum FanControlStrategy: String, Codable {
 }
 
 public final class FanService {
-    private let connection: SMCConnection
+    private let connection: SMCTransport
+    private let clock: () -> TimeInterval
+    private let sleep: (TimeInterval) -> Void
 
-    public init(connection: SMCConnection) {
+    public init(connection: SMCTransport,
+                clock: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+                sleep: @escaping (TimeInterval) -> Void = { Thread.sleep(forTimeInterval: $0) }) {
         self.connection = connection
+        self.clock = clock
+        self.sleep = sleep
     }
 
     public static func make() throws -> FanService {
@@ -62,7 +74,8 @@ public final class FanService {
         return FanSnapshot(
             fans: fans,
             modeKeyFormat: modeKeyFormat,
-            forceTestAvailable: forceTestAvailable
+            forceTestAvailable: forceTestAvailable,
+            forceTestRawValue: forceTestAvailable ? try? readRawMode(key: "Ftst") : nil
         )
     }
 
@@ -72,25 +85,29 @@ public final class FanService {
             throw SMCError.noFans
         }
 
+        guard rpm.isFinite, rpm > 0, fan.maxRPM.isFinite,
+              fan.maxRPM >= fan.safeMinimumManualRPM else { throw FanControlError.invalidLimits }
         let boundedRPM = min(max(rpm, fan.safeMinimumManualRPM), fan.maxRPM)
-        let strategy = try enableManualMode(index: index, snapshot: snapshot)
         do {
+            let strategy = try enableManualMode(index: index, snapshot: snapshot)
             try writeRPM(key: fanKey("F%dTg", index), rpm: boundedRPM)
+            return strategy
         } catch {
-            try? setFanAuto(index: index)
+            try recoverAfterFailure(error)
             throw error
         }
-        return strategy
     }
 
     public func setFanAuto(index: Int) throws {
-        let snapshot = try snapshot()
-        guard snapshot.fans.contains(where: { $0.index == index }) else {
+        let count = try fanCount()
+        guard (0..<count).contains(index) else {
             throw SMCError.noFans
         }
-
+        let format = detectModeKeyFormat()
+        let forceTestAvailable = keyExists("Ftst")
+        guard format != nil else { throw FanControlError.autoNotConfirmed }
         var firstError: Error?
-        if let modeKey = modeKey(index: index, format: snapshot.modeKeyFormat) {
+        if let modeKey = modeKey(index: index, format: format) {
             do {
                 try connection.writeKey(modeKey, bytes: [0])
             } catch {
@@ -98,20 +115,19 @@ public final class FanService {
             }
         }
 
-        let remainingManual = snapshot.fans
-            .filter { $0.index != index }
-            .contains { fan in
-                if let modeKey = modeKey(index: fan.index, format: snapshot.modeKeyFormat),
+        let remainingManual = (0..<count)
+            .filter { $0 != index }
+            .contains { otherIndex in
+                if let modeKey = modeKey(index: otherIndex, format: format),
                    let mode = try? readMode(key: modeKey) {
-                    return mode == .manual
+                    return mode != .automatic && mode != .system
                 }
-                return false
+                return true
             }
 
-        if !remainingManual, snapshot.forceTestAvailable {
+        if !remainingManual, forceTestAvailable {
             do {
                 try connection.writeKey("Ftst", bytes: [0])
-                firstError = nil
             } catch {
                 if firstError == nil {
                     firstError = error
@@ -119,16 +135,20 @@ public final class FanService {
             }
         }
 
-        if let firstError {
-            throw firstError
-        }
+        try confirmAutomaticControl(indices: [index], format: format,
+                                    forceTestMustBeOff: !remainingManual && forceTestAvailable,
+                                    firstWriteError: firstError)
     }
 
     public func setAllFansAuto() throws {
-        let snapshot = try snapshot()
+        let count = try fanCount()
+        let format = detectModeKeyFormat()
+        let forceTestAvailable = keyExists("Ftst")
+        guard format != nil || forceTestAvailable else { throw FanControlError.autoNotConfirmed }
         var firstError: Error?
-        for fan in snapshot.fans {
-            if let modeKey = modeKey(index: fan.index, format: snapshot.modeKeyFormat) {
+        for index in 0..<count {
+            if let modeKey = modeKey(index: index, format: format) {
+                if let mode = try? readMode(key: modeKey), mode == .automatic || mode == .system { continue }
                 do {
                     try connection.writeKey(modeKey, bytes: [0])
                 } catch {
@@ -139,10 +159,9 @@ public final class FanService {
             }
         }
 
-        if snapshot.forceTestAvailable {
+        if forceTestAvailable, (try? readRawMode(key: "Ftst")) != 0 {
             do {
                 try connection.writeKey("Ftst", bytes: [0])
-                firstError = nil
             } catch {
                 if firstError == nil {
                     firstError = error
@@ -150,45 +169,95 @@ public final class FanService {
             }
         }
 
-        if let firstError {
-            throw firstError
+        try confirmAutomaticControl(indices: Array(0..<count), format: format,
+                                    forceTestMustBeOff: forceTestAvailable,
+                                    firstWriteError: firstError)
+    }
+
+    private func confirmAutomaticControl(indices: [Int], format: String?,
+                                         forceTestMustBeOff: Bool, firstWriteError: Error?) throws {
+        // El firmware puede aceptar la escritura antes de reflejar el modo de macOS.
+        // Solo repetimos lecturas, nunca la orden de control.
+        let deadline = clock() + 5
+        while true {
+            var confirmed = true
+            var readings: [String] = []
+            for index in indices {
+                if let key = modeKey(index: index, format: format) {
+                    if let raw = try? readRawMode(key: key) {
+                        let mode = decodeMode(raw)
+                        confirmed = confirmed && (mode == .automatic || mode == .system)
+                        readings.append("\(key)=\(raw)")
+                    } else {
+                        confirmed = false
+                        readings.append("\(key)=sin lectura")
+                    }
+                }
+            }
+            if forceTestMustBeOff {
+                if let raw = try? readRawMode(key: "Ftst") {
+                    confirmed = confirmed && raw == 0
+                    readings.append("Ftst=\(raw)")
+                } else {
+                    confirmed = false
+                    readings.append("Ftst=sin lectura")
+                }
+            }
+            if confirmed { return }
+            guard clock() < deadline else {
+                let detail = readings.joined(separator: ", ")
+                throw FanControlError.autoConfirmationFailed(
+                    firstWriteError.map { "\(detail). \($0.localizedDescription)" } ?? detail
+                )
+            }
+            sleep(max(0, min(0.1, deadline - clock())))
         }
     }
 
     public func setAllFansToMaximum() throws {
         let snapshot = try snapshot()
-        var firstError: Error?
-
-        for fan in snapshot.fans {
-            do {
-                _ = try enableManualMode(index: fan.index, snapshot: snapshot)
-                try writeRPM(key: fanKey("F%dTg", fan.index), rpm: fan.maxRPM)
-            } catch {
-                if firstError == nil {
-                    firstError = error
+        let deadline = clock() + 10
+        do {
+            for fan in snapshot.fans {
+                guard fan.maxRPM.isFinite, fan.maxRPM >= fan.safeMinimumManualRPM else {
+                    throw FanControlError.invalidLimits
                 }
-                try? setFanAuto(index: fan.index)
+                _ = try enableManualMode(index: fan.index, snapshot: snapshot, deadline: deadline)
+                try writeRPM(key: fanKey("F%dTg", fan.index), rpm: fan.maxRPM)
             }
+        } catch {
+            try recoverAfterFailure(error)
+            throw error
         }
+    }
 
-        if let firstError {
-            throw firstError
+    private func recoverAfterFailure(_ originalError: Error) throws {
+        do { try setAllFansAuto() }
+        catch {
+            throw FanControlError.recoveryFailed(originalError.localizedDescription, error.localizedDescription)
         }
     }
 
     private func fanCount() throws -> Int {
         let result = try connection.readKey("FNum")
         if result.size >= 2 {
-            return Int(SMCDataFormat.uint16(from: result.bytes))
+            let count = Int(SMCDataFormat.uint16(from: result.bytes))
+            guard (1...16).contains(count) else { throw SMCError.noFans }
+            return count
         }
-        return Int(SMCDataFormat.uint8(from: result.bytes))
+        let count = Int(SMCDataFormat.uint8(from: result.bytes))
+        guard (1...16).contains(count) else { throw SMCError.noFans }
+        return count
     }
 
     private func readFan(index: Int, modeKeyFormat: String?) throws -> FanReading {
         let actual = try readRPM(key: fanKey("F%dAc", index))
         let target = (try? readRPM(key: fanKey("F%dTg", index))) ?? 0
         let minimum = (try? readRPM(key: fanKey("F%dMn", index))) ?? 0
-        let maximum = (try? readRPM(key: fanKey("F%dMx", index))) ?? max(actual, target, minimum)
+        let maximum = (try? readRPM(key: fanKey("F%dMx", index))) ?? 0
+        guard [actual, target, minimum, maximum].allSatisfy({ $0.isFinite && $0 >= 0 && $0 <= 100_000 }) else {
+            throw FanControlError.invalidReading
+        }
         let modeKey = modeKey(index: index, format: modeKeyFormat)
         let rawMode: UInt8?
         if let modeKey {
@@ -209,7 +278,9 @@ public final class FanService {
         )
     }
 
-    private func enableManualMode(index: Int, snapshot: FanSnapshot) throws -> FanControlStrategy {
+    private func enableManualMode(index: Int, snapshot: FanSnapshot, deadline suppliedDeadline: TimeInterval? = nil) throws -> FanControlStrategy {
+        let deadline = suppliedDeadline ?? (clock() + 10)
+        guard clock() < deadline else { throw SMCError.timeout }
         guard let modeKey = modeKey(index: index, format: snapshot.modeKeyFormat) else {
             throw SMCError.firmware(.notFound)
         }
@@ -224,15 +295,14 @@ public final class FanService {
         }
 
         try connection.writeKey("Ftst", bytes: [1])
-        Thread.sleep(forTimeInterval: 0.5)
+        sleep(0.5)
 
-        let deadline = Date().addingTimeInterval(10)
-        while Date() < deadline {
+        while clock() < deadline {
             do {
                 try connection.writeKey(modeKey, bytes: [1])
                 return .forceTestUnlock
             } catch {
-                Thread.sleep(forTimeInterval: 0.1)
+                sleep(0.1)
             }
         }
 
@@ -274,7 +344,11 @@ public final class FanService {
     }
 
     private func readRawMode(key: String) throws -> UInt8 {
-        SMCDataFormat.uint8(from: try connection.readKey(key).bytes)
+        let result = try connection.readKey(key)
+        guard result.size == 1, result.bytes.count == 1, let raw = result.bytes.first else {
+            throw FanControlError.invalidReading
+        }
+        return raw
     }
 
     private func readMode(key: String) throws -> FanMode {
@@ -291,6 +365,26 @@ public final class FanService {
             return .system
         default:
             return .unknown
+        }
+    }
+}
+
+public enum FanControlError: LocalizedError {
+    case invalidLimits
+    case invalidReading
+    case autoNotConfirmed
+    case autoConfirmationFailed(String)
+    case recoveryFailed(String, String)
+
+    public var errorDescription: String? {
+        switch self {
+        case .invalidLimits: return "Los límites RPM no son válidos; no se aplicó control manual."
+        case .invalidReading: return "Los ventiladores devolvieron una lectura inválida."
+        case .autoNotConfirmed: return "No se pudo confirmar la vuelta de los ventiladores a Auto."
+        case .autoConfirmationFailed(let detail):
+            return "No se pudo confirmar la vuelta de los ventiladores a Auto tras 5 segundos. Estado: \(detail)."
+        case .recoveryFailed(let original, let recovery):
+            return "\(original) La recuperación a Auto también falló: \(recovery)"
         }
     }
 }

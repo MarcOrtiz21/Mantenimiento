@@ -81,6 +81,25 @@ enum MaintenanceAlertEvaluator {
             }
         }
 
+        if AppPreferences.diskAlertsEnabled {
+            let root = snapshot.telemetry.volumes.first(where: \.isRootVolume)
+            let total = root?.totalBytes ?? snapshot.telemetry.disk.totalBytes
+            let available = root?.availableBytes ?? snapshot.telemetry.disk.availableBytes
+            if total > 0 {
+                let freeRatio = Double(available) / Double(total)
+                if freeRatio < AppPreferences.diskFreeThreshold {
+                    alerts.append(MaintenanceAlert(
+                        id: "disk.low",
+                        severity: freeRatio < AppPreferences.diskFreeThreshold / 2 ? .critical : .warning,
+                        title: "Poco espacio en disco",
+                        detail: "Quedan \(ByteCountFormatter.string(fromByteCount: Int64(available), countStyle: .file)) libres (\(alertPercent(freeRatio)))",
+                        requiredSamples: 2,
+                        requiresFreshSMC: false
+                    ))
+                }
+            }
+        }
+
         if AppPreferences.appCostAlertsEnabled,
            let cpuRatio = snapshot.appResources.cpuRatio,
            cpuRatio >= AppPreferences.appCPUThreshold {
@@ -151,6 +170,12 @@ final class MaintenanceAlertMonitor {
             if state.consecutiveSamples >= alert.requiredSamples {
                 if !state.isActive {
                     state.isActive = true
+                    EventLog.shared.record(
+                        .alert,
+                        severity: alert.severity == .critical ? .critical : .warning,
+                        title: alert.title,
+                        detail: alert.detail
+                    )
                 }
                 if shouldNotify(state: state) {
                     state.lastNotificationDate = Date()
@@ -181,6 +206,74 @@ final class MaintenanceAlertMonitor {
             return true
         }
         return Date().timeIntervalSince(lastNotificationDate) >= AppPreferences.alertCooldown
+    }
+}
+
+/// Detecta procesos que mantienen un uso de CPU alto durante minutos (bucles, apps colgadas).
+final class RunawayProcessDetector {
+    static let shared = RunawayProcessDetector()
+
+    private static let ignoredProcesses: Set<String> = ["kernel_task", "Mantenimiento", "mantenimiento-helper"]
+
+    private var firstSeenAbove: [String: Date] = [:]
+    private var lastNotified: [String: Date] = [:]
+    private(set) var lastSampleDate: Date?
+
+    init() {}
+
+    /// `entries` son los de `ps`: `sortValue` es % de CPU donde 100 equivale a un núcleo.
+    func process(entries: [MenuDemandEntry], now: Date = Date()) -> [MaintenanceAlert] {
+        lastSampleDate = now
+        guard AppPreferences.runawayProcessAlertsEnabled else {
+            firstSeenAbove.removeAll()
+            return []
+        }
+
+        let thresholdPercent = AppPreferences.runawayProcessThreshold * 100
+        let duration = AppPreferences.runawayProcessDuration
+        var above: Set<String> = []
+        var alerts: [MaintenanceAlert] = []
+
+        for entry in entries where entry.sortValue >= thresholdPercent {
+            let name = URL(fileURLWithPath: entry.name).lastPathComponent
+            guard !Self.ignoredProcesses.contains(name) else { continue }
+            above.insert(name)
+            let since = firstSeenAbove[name] ?? now
+            firstSeenAbove[name] = since
+            guard now.timeIntervalSince(since) >= duration else { continue }
+            if let notified = lastNotified[name], now.timeIntervalSince(notified) < AppPreferences.alertCooldown {
+                continue
+            }
+            lastNotified[name] = now
+            let minutes = Int((now.timeIntervalSince(since) / 60).rounded())
+            alerts.append(MaintenanceAlert(
+                id: "process.\(name)",
+                severity: entry.sortValue >= 200 ? .critical : .warning,
+                title: "\(name) usa mucha CPU",
+                detail: String(format: "%.0f%% de CPU durante %d min. Puede estar colgado o en bucle.", entry.sortValue, max(minutes, 1)),
+                requiredSamples: 1,
+                requiresFreshSMC: false
+            ))
+        }
+
+        for name in Array(firstSeenAbove.keys) where !above.contains(name) {
+            firstSeenAbove[name] = nil
+        }
+        return alerts
+    }
+
+    func deliver(_ alerts: [MaintenanceAlert]) {
+        for alert in alerts {
+            EventLog.shared.record(
+                .alert,
+                severity: alert.severity == .critical ? .critical : .warning,
+                title: alert.title,
+                detail: alert.detail
+            )
+            if AppPreferences.systemNotificationsEnabled {
+                AlertNotificationService.shared.send(alert)
+            }
+        }
     }
 }
 

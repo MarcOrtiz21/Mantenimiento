@@ -8,6 +8,8 @@ final class StatusPopoverController: NSObject, NSPopoverDelegate {
     private let model = StatusPopoverModel()
     private let actions: StatusPopoverActions
     private let onClose: () -> Void
+    private var measuredHeight: CGFloat = 540
+    private var maximumHeight: CGFloat = 540
 
     var isShown: Bool {
         popover.isShown
@@ -23,16 +25,33 @@ final class StatusPopoverController: NSObject, NSPopoverDelegate {
         popover.contentSize = NSSize(width: 430, height: 540)
         popover.delegate = self
         popover.contentViewController = NSHostingController(
-            rootView: StatusPopoverView(model: model, actions: actions)
+            rootView: StatusPopoverView(model: model, actions: actions) { [weak self] height in
+                self?.resizeToContent(height)
+            }
         )
     }
 
     func show(relativeTo button: NSButton, initialSection: MenuBarSection) {
         select(initialSection)
+        if let window = button.window, let screen = window.screen {
+            let anchor = window.convertToScreen(button.convert(button.bounds, to: nil))
+            maximumHeight = max(1, min(screen.visibleFrame.height, anchor.minY - screen.visibleFrame.minY) - 16)
+        } else {
+            maximumHeight = max(1, (NSScreen.main?.visibleFrame.height ?? 556) - 16)
+        }
+        resizeToContent(measuredHeight)
         if popover.isShown {
             return
         }
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+    }
+
+    private func resizeToContent(_ height: CGFloat) {
+        measuredHeight = height
+        let preferredHeight = StatusPopoverLayout.height(contentHeight: height, availableHeight: maximumHeight)
+        guard abs(model.preferredHeight - preferredHeight) >= 1 else { return }
+        model.preferredHeight = preferredHeight
+        popover.contentSize = NSSize(width: 430, height: preferredHeight)
     }
 
     func close() {
@@ -55,6 +74,7 @@ final class StatusPopoverController: NSObject, NSPopoverDelegate {
         activeProfile: PerformanceProfile,
         isApplyingProfile: Bool
     ) {
+        dispatchPrecondition(condition: .onQueue(.main))
         model.snapshot = snapshot
         model.selectedSection = selectedSection
         model.detailRows = detailRows
@@ -87,6 +107,7 @@ struct StatusPopoverActions {
 }
 
 final class StatusPopoverModel: ObservableObject {
+    @Published var preferredHeight: CGFloat = 540
     @Published var snapshot: MenuBarSnapshot?
     @Published var selectedSection: MenuBarSection = .overview
     @Published var detailRows: [MenuInfoLine] = [MenuInfoLine(title: "Estado", value: "Calculando...")]
@@ -103,26 +124,54 @@ final class StatusPopoverModel: ObservableObject {
 private struct StatusPopoverView: View {
     @ObservedObject var model: StatusPopoverModel
     let actions: StatusPopoverActions
+    let onContentHeightChange: (CGFloat) -> Void
 
     var body: some View {
         VStack(spacing: 0) {
             header
+                .background(heightMeasurement)
 
             ScrollView {
                 VStack(spacing: 12) {
                     summaryGrid
+                    if let snapshot = model.snapshot {
+                        if !snapshot.sensorStatus.isCurrent {
+                            Label("Sensores: \(snapshot.sensorStatus.description)", systemImage: "exclamationmark.triangle")
+                                .font(.caption)
+                                .foregroundStyle(.orange)
+                                .help(snapshot.sensorStatus.error ?? "")
+                        }
+                        if !snapshot.fanStatus.isCurrent {
+                            Label("Ventiladores: \(snapshot.fanStatus.description)", systemImage: "exclamationmark.triangle")
+                                .font(.caption)
+                                .foregroundStyle(.orange)
+                                .help(snapshot.fanStatus.error ?? "")
+                        }
+                    }
                     warningsSection
                     sectionSelector
                     detailSection
                     demandSection
-                    quickActions
                 }
                 .padding(14)
+                .fixedSize(horizontal: false, vertical: true)
+                .background(heightMeasurement)
             }
             .scrollIndicators(.visible)
+            quickActions
+                .padding(14)
+                .background(.bar)
+                .background(heightMeasurement)
         }
-        .frame(width: 430, height: 540)
+        .frame(width: 430, height: model.preferredHeight)
         .background(.regularMaterial)
+        .onPreferenceChange(PopoverContentHeightKey.self, perform: onContentHeightChange)
+    }
+
+    private var heightMeasurement: some View {
+        GeometryReader { geometry in
+            Color.clear.preference(key: PopoverContentHeightKey.self, value: geometry.size.height)
+        }
     }
 
     private var header: some View {
@@ -175,7 +224,7 @@ private struct StatusPopoverView: View {
             )
             PopoverMetricTile(
                 title: "RAM",
-                value: model.snapshot.map { popoverPercent($0.telemetry.memory.usedRatio) } ?? "--",
+                value: model.snapshot.flatMap { $0.telemetry.memory.isAvailable ? popoverPercent($0.telemetry.memory.usedRatio) : nil } ?? "--",
                 detail: model.snapshot?.telemetry.memory.pressureDescription ?? "sin datos",
                 symbol: "memorychip",
                 tint: .green
@@ -257,7 +306,7 @@ private struct StatusPopoverView: View {
     private var demandSection: some View {
         if !model.isDemandHidden {
             PopoverPanel(
-                title: model.isDemandLoading ? "Mayor demanda - actualizando" : "Mayor demanda",
+                title: demandTitle,
                 symbol: "list.bullet.rectangle"
             ) {
                 VStack(spacing: 0) {
@@ -358,6 +407,16 @@ private struct StatusPopoverView: View {
         }
         .buttonStyle(.bordered)
         .controlSize(.small)
+    }
+
+    private var demandTitle: String {
+        let title: String
+        switch model.selectedSection {
+        case .network: title = "Mayor demanda · TCP"
+        case .gpu: title = "Mayor demanda · estimación GPU"
+        default: title = "Mayor demanda"
+        }
+        return model.isDemandLoading ? title + " · actualizando" : title
     }
 
     private var headerSubtitle: String {
@@ -501,6 +560,7 @@ private struct PopoverInfoRow: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
+                .help(row.title)
 
             Spacer(minLength: 8)
 
@@ -508,10 +568,25 @@ private struct PopoverInfoRow: View {
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(.primary)
                 .monospacedDigit()
-                .lineLimit(1)
-                .truncationMode(.middle)
+                .multilineTextAlignment(.trailing)
+                .fixedSize(horizontal: false, vertical: true)
+                .help(row.value)
         }
         .frame(minHeight: 25)
+    }
+}
+
+enum StatusPopoverLayout {
+    static func height(contentHeight: CGFloat, availableHeight: CGFloat) -> CGFloat {
+        min(ceil(max(180, contentHeight)), max(1, availableHeight))
+    }
+}
+
+private struct PopoverContentHeightKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value += nextValue()
     }
 }
 
@@ -538,18 +613,7 @@ struct PopoverAppMark: View {
     let size: CGFloat
 
     var body: some View {
-        ZStack {
-            RoundedRectangle(cornerRadius: size * 0.22, style: .continuous)
-                .fill(.thinMaterial)
-                .overlay(
-                    RoundedRectangle(cornerRadius: size * 0.22, style: .continuous)
-                        .stroke(Color(nsColor: .separatorColor), lineWidth: 1)
-                )
-            Image(systemName: "fanblades.fill")
-                .font(.system(size: size * 0.48, weight: .semibold))
-                .foregroundStyle(.tint)
-        }
-        .frame(width: size, height: size)
+        AppIconView(size: size)
     }
 }
 

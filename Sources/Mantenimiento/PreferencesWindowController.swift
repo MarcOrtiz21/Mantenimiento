@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import MantenimientoCore
 
 final class PreferencesWindowController: NSWindowController {
     init() {
@@ -57,6 +58,8 @@ private struct GeneralPreferencesView: View {
     @AppStorage(AppPreferenceKeys.showGPUInMenuBar) private var showGPU = true
     @AppStorage(AppPreferenceKeys.showMemoryInMenuBar) private var showMemory = true
     @AppStorage(AppPreferenceKeys.showNetworkInMenuBar) private var showNetwork = true
+    @State private var launchAtLogin = LaunchAtLogin.state == .enabled
+    @State private var launchAtLoginStatus = LaunchAtLogin.stateDescription
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -66,6 +69,22 @@ private struct GeneralPreferencesView: View {
             )
 
             PreferencesPanel(title: "General", symbol: "gearshape") {
+                Toggle("Abrir al iniciar sesión", isOn: $launchAtLogin)
+                    .disabled(LaunchAtLogin.state == .unavailable)
+                    .onChange(of: launchAtLogin) { enabled in
+                        updateLaunchAtLogin(enabled)
+                    }
+                HStack(spacing: 8) {
+                    Text(launchAtLoginStatus)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    if LaunchAtLogin.state == .requiresApproval {
+                        Button("Abrir Ítems de inicio") {
+                            LaunchAtLogin.openSystemSettings()
+                        }
+                        .controlSize(.small)
+                    }
+                }
                 Toggle("Abrir panel al iniciar", isOn: $openPanelAtLaunch)
                 Picker("Refresco barra", selection: $statusRefreshInterval) {
                     Text("1.5 s").tag(1.5)
@@ -105,6 +124,22 @@ private struct GeneralPreferencesView: View {
             Spacer(minLength: 0)
         }
         .padding(8)
+        .onAppear {
+            launchAtLogin = LaunchAtLogin.state == .enabled
+            launchAtLoginStatus = LaunchAtLogin.stateDescription
+        }
+    }
+
+    private func updateLaunchAtLogin(_ enabled: Bool) {
+        let current = LaunchAtLogin.state
+        guard enabled != (current == .enabled || current == .requiresApproval) else { return }
+        do {
+            try LaunchAtLogin.setEnabled(enabled)
+            launchAtLoginStatus = LaunchAtLogin.stateDescription
+        } catch {
+            launchAtLoginStatus = "No se pudo cambiar: \(error.localizedDescription)"
+            launchAtLogin = LaunchAtLogin.state == .enabled
+        }
     }
 }
 
@@ -256,12 +291,10 @@ private struct HelperPreferencesView: View {
     private func refreshStatus() {
         Task.detached(priority: .utility) {
             let ping = PrivilegedHelperInstaller.ping()
+            let isCurrent = PrivilegedHelperInstaller.installedHelperMatchesBundle()
             await MainActor.run {
-                isConnected = ping != nil
-                statusText = ping != nil ? "Conectado" : "No instalado o inactivo"
-                if let ping {
-                    lastMessage = ping
-                }
+                isConnected = ping == FanHelperProtocol.greeting && isCurrent
+                statusText = isConnected ? "Conectado · supervisión activa" : ping != nil ? "Actualización necesaria" : "No instalado o inactivo"
             }
         }
     }
@@ -329,6 +362,11 @@ private struct AlertPreferencesView: View {
     @AppStorage(AppPreferenceKeys.appCostAlertsEnabled) private var appCostAlertsEnabled = false
     @AppStorage(AppPreferenceKeys.appCPUThreshold) private var appCPUThreshold = 0.10
     @AppStorage(AppPreferenceKeys.alertCooldown) private var alertCooldown = 900.0
+    @AppStorage(AppPreferenceKeys.diskAlertsEnabled) private var diskAlertsEnabled = true
+    @AppStorage(AppPreferenceKeys.diskFreeThreshold) private var diskFreeThreshold = 0.10
+    @AppStorage(AppPreferenceKeys.runawayProcessAlertsEnabled) private var runawayAlertsEnabled = true
+    @AppStorage(AppPreferenceKeys.runawayProcessThreshold) private var runawayThreshold = 0.9
+    @AppStorage(AppPreferenceKeys.runawayProcessDuration) private var runawayDuration = 300.0
 
     @State private var authorizationDescription = "Consultando..."
     @State private var testStatus = ""
@@ -406,6 +444,29 @@ private struct AlertPreferencesView: View {
 
                 Toggle("Ventilador sin respuesta", isOn: $fanAlertsEnabled)
 
+                Toggle("Poco espacio en disco", isOn: $diskAlertsEnabled)
+
+                Stepper(value: $diskFreeThreshold, in: 0.05...0.25, step: 0.01) {
+                    PreferenceValueRow(title: "Avisar por debajo de", value: "\(Int((diskFreeThreshold * 100).rounded()))% libre")
+                }
+                .disabled(!diskAlertsEnabled)
+
+                Toggle("Proceso con CPU alta sostenida", isOn: $runawayAlertsEnabled)
+
+                Picker("Uso mínimo", selection: $runawayThreshold) {
+                    Text("90% (1 núcleo)").tag(0.9)
+                    Text("150%").tag(1.5)
+                    Text("300%").tag(3.0)
+                }
+                .disabled(!runawayAlertsEnabled)
+
+                Picker("Durante", selection: $runawayDuration) {
+                    Text("2 min").tag(120.0)
+                    Text("5 min").tag(300.0)
+                    Text("15 min").tag(900.0)
+                }
+                .disabled(!runawayAlertsEnabled)
+
                 Toggle("Consumo de Mantenimiento", isOn: $appCostAlertsEnabled)
 
                 Stepper(value: $appCPUThreshold, in: 0.03...0.50, step: 0.01) {
@@ -482,6 +543,11 @@ private struct AlertPreferencesView: View {
         appCostAlertsEnabled = false
         appCPUThreshold = 0.10
         alertCooldown = 900
+        diskAlertsEnabled = true
+        diskFreeThreshold = 0.10
+        runawayAlertsEnabled = true
+        runawayThreshold = 0.9
+        runawayDuration = 300
         testStatus = ""
     }
 }

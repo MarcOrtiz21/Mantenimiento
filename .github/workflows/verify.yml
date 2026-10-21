@@ -1,0 +1,40 @@
+name: Verify macOS app
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: macos-15
+    timeout-minutes: 20
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+      CODE_SIGN_IDENTITY: '-'
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Check shell scripts
+        run: |
+          for script in Scripts/*.sh script/*.sh; do
+            bash -n "$script"
+          done
+
+      - name: Run tests
+        run: bash Scripts/test.sh
+
+      - name: Build release bundle
+        run: bash Scripts/build-app.sh release
+
+      - name: Verify bundle and signature
+        run: |
+          plutil -lint .build/release/Mantenimiento.app/Contents/Info.plist
+          codesign --verify --deep --strict .build/release/Mantenimiento.app
+          test -s .build/release/Mantenimiento.app/Contents/Resources/AppIcon.icns
+          test -x .build/release/Mantenimiento.app/Contents/MacOS/mantenimiento-fanctl
+          test -x .build/release/Mantenimiento.app/Contents/Library/PrivilegedHelperTools/local.marc.mantenimiento.helper

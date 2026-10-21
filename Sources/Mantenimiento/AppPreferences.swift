@@ -20,6 +20,11 @@ enum AppPreferenceKeys {
     static let appCostAlertsEnabled = "appCostAlertsEnabled"
     static let appCPUThreshold = "appCPUThreshold"
     static let alertCooldown = "alertCooldown"
+    static let diskAlertsEnabled = "diskAlertsEnabled"
+    static let diskFreeThreshold = "diskFreeThreshold"
+    static let runawayProcessAlertsEnabled = "runawayProcessAlertsEnabled"
+    static let runawayProcessThreshold = "runawayProcessThreshold"
+    static let runawayProcessDuration = "runawayProcessDuration"
 }
 
 enum AppPreferences {
@@ -43,7 +48,12 @@ enum AppPreferences {
             AppPreferenceKeys.fanAlertsEnabled: true,
             AppPreferenceKeys.appCostAlertsEnabled: false,
             AppPreferenceKeys.appCPUThreshold: 0.10,
-            AppPreferenceKeys.alertCooldown: 900.0
+            AppPreferenceKeys.alertCooldown: 900.0,
+            AppPreferenceKeys.diskAlertsEnabled: true,
+            AppPreferenceKeys.diskFreeThreshold: 0.10,
+            AppPreferenceKeys.runawayProcessAlertsEnabled: true,
+            AppPreferenceKeys.runawayProcessThreshold: 0.9,
+            AppPreferenceKeys.runawayProcessDuration: 300.0
         ])
     }
 
@@ -124,5 +134,26 @@ enum AppPreferences {
 
     static var alertCooldown: TimeInterval {
         max(UserDefaults.standard.double(forKey: AppPreferenceKeys.alertCooldown), 300)
+    }
+
+    static var diskAlertsEnabled: Bool {
+        UserDefaults.standard.bool(forKey: AppPreferenceKeys.diskAlertsEnabled)
+    }
+
+    static var diskFreeThreshold: Double {
+        min(max(UserDefaults.standard.double(forKey: AppPreferenceKeys.diskFreeThreshold), 0.03), 0.30)
+    }
+
+    static var runawayProcessAlertsEnabled: Bool {
+        UserDefaults.standard.bool(forKey: AppPreferenceKeys.runawayProcessAlertsEnabled)
+    }
+
+    /// Fracción de un núcleo (1,0 = un núcleo completo).
+    static var runawayProcessThreshold: Double {
+        min(max(UserDefaults.standard.double(forKey: AppPreferenceKeys.runawayProcessThreshold), 0.5), 4)
+    }
+
+    static var runawayProcessDuration: TimeInterval {
+        min(max(UserDefaults.standard.double(forKey: AppPreferenceKeys.runawayProcessDuration), 60), 3_600)
     }
 }

@@ -1,7 +1,13 @@
 import Foundation
 import IOKit
 
-public final class SMCConnection {
+public protocol SMCTransport {
+    func readKey(_ key: String) throws -> (bytes: [UInt8], size: UInt32)
+    func writeKey(_ key: String, bytes: [UInt8]) throws
+    func fetchKeyInfo(_ key: String) throws -> (param: SMCParamStruct, output: SMCParamStruct)
+}
+
+public final class SMCConnection: SMCTransport {
     private let connection: io_connect_t
 
     public init() throws {

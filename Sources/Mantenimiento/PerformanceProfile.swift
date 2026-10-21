@@ -53,28 +53,10 @@ enum PerformanceProfileService {
     }
 
     private static func setFansAuto() async throws {
-        do {
-            try FanService.make().setAllFansAuto()
-        } catch {
-            guard PrivilegedFanTool.shouldRetryPrivileged(error) else {
-                throw error
-            }
-            _ = try await Task.detached(priority: .userInitiated) {
-                try PrivilegedFanTool.setAllFansAuto()
-            }.value
-        }
+        _ = try await Task.detached(priority: .userInitiated) { try PrivilegedFanTool.setAllFansAuto() }.value
     }
 
     private static func setFansTurbo() async throws {
-        do {
-            try FanService.make().setAllFansToMaximum()
-        } catch {
-            guard PrivilegedFanTool.shouldRetryPrivileged(error) else {
-                throw error
-            }
-            _ = try await Task.detached(priority: .userInitiated) {
-                try PrivilegedFanTool.setAllFansTurbo()
-            }.value
-        }
+        _ = try await Task.detached(priority: .userInitiated) { try PrivilegedFanTool.setAllFansTurbo() }.value
     }
 }

@@ -59,7 +59,7 @@ enum MenuBarSection: String, Hashable, CaseIterable, Identifiable {
     }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate, CleanModeControllerDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, CleanModeControllerDelegate, NSMenuItemValidation {
     private var statusItem: NSStatusItem?
     private var statusView: CompactStatusBarView?
     private lazy var cleanController = CleanModeController(delegate: self)
@@ -79,8 +79,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CleanModeControllerDel
     private var demandCache: [MenuBarSection: [MenuDemandEntry]] = [:]
     private var demandRefreshDates: [MenuBarSection: Date] = [:]
     private var refreshingDemandSections: Set<MenuBarSection> = []
-    private var activeMenuRefreshTask: Task<Void, Never>?
     private var anomalousFanSamples = 0
+    private var lastFanSafetyDate: Date?
+    private var fanHeartbeatTimer: Timer?
+    private var isSendingFanHeartbeat = false
+    private var isRestoringFans = false
+    private var isSamplingRunawayProcesses = false
 
     func applicationWillFinishLaunching(_ notification: Notification) {
         AlertNotificationService.shared.configure()
@@ -90,6 +94,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CleanModeControllerDel
     func applicationDidFinishLaunching(_ notification: Notification) {
         AppPreferences.registerDefaults()
         activeProfile = AppPreferences.statusRefreshInterval >= 5 ? .silent : .balanced
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(telemetryDidUpdate(_:)), name: .telemetryUpdated, object: nil
+        )
+        for name in [NSWindow.didBecomeKeyNotification, NSWindow.didMiniaturizeNotification,
+                     NSWindow.didDeminiaturizeNotification, NSWindow.didChangeOcclusionStateNotification,
+                     NSWindow.willCloseNotification] {
+            NotificationCenter.default.addObserver(
+                self, selector: #selector(diagnosticsVisibilityDidChange(_:)), name: name, object: nil
+            )
+        }
         configureStatusItem()
         appLogger.info("Application launched; status item configured: \(self.statusItem != nil, privacy: .public)")
         checkPrivilegedHelper()
@@ -100,6 +114,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CleanModeControllerDel
             selector: #selector(markFanManualControlTouched),
             name: .fanManualControlDidSucceed,
             object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(markFanAutomaticControlConfirmed), name: .fanAutomaticControlDidSucceed, object: nil
         )
         NotificationCenter.default.addObserver(
             self,
@@ -137,6 +154,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CleanModeControllerDel
             name: .preferencesRequested,
             object: nil
         )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(thermalStateDidChange),
+            name: ProcessInfo.thermalStateDidChangeNotification,
+            object: nil
+        )
+        EventLog.shared.record(.system, title: "Mantenimiento iniciado")
         if AppPreferences.openPanelAtLaunch {
             openDiagnostics()
         }
@@ -144,7 +168,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CleanModeControllerDel
 
     func applicationWillTerminate(_ notification: Notification) {
         statusRefreshTimer?.invalidate()
-        activeMenuRefreshTask?.cancel()
+        fanHeartbeatTimer?.invalidate()
         statusPopoverController?.close()
         cleanController.stop()
         resetFansIfNeeded()
@@ -237,6 +261,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CleanModeControllerDel
         )
         showPanelItem.target = self
         windowMenu.addItem(showPanelItem)
+        let showStatusItem = NSMenuItem(
+            title: "Mostrar estado",
+            action: #selector(showStatusFromMenu),
+            keyEquivalent: "0"
+        )
+        showStatusItem.keyEquivalentModifierMask = [.command, .shift]
+        showStatusItem.target = self
+        windowMenu.addItem(showStatusItem)
         windowMenu.addItem(withTitle: "Minimizar", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
         windowMenu.addItem(withTitle: "Zoom", action: #selector(NSWindow.performZoom(_:)), keyEquivalent: "")
         windowMenu.addItem(.separator())
@@ -251,6 +283,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CleanModeControllerDel
 
         NSApp.mainMenu = mainMenu
         NSApp.windowsMenu = windowMenu
+    }
+
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        if menuItem.action == #selector(showStatusFromMenu) {
+            return AppPreferences.showStatusItem && statusItem?.button?.window != nil
+        }
+        return true
+    }
+
+    @objc private func showStatusFromMenu() {
+        guard let button = statusItem?.button else { return }
+        presentStatusPopover(section: .overview, from: button)
     }
 
     @objc private func showAbout() {
@@ -307,8 +351,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CleanModeControllerDel
             return
         }
 
-        activeMenuRefreshTask?.cancel()
-        activeMenuRefreshTask = nil
         activeStatusMenu = nil
         activeMenuSection = nil
         activeMenuHandles = nil
@@ -378,11 +420,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CleanModeControllerDel
         statusRefreshTimer = timer
     }
 
+    @objc private func diagnosticsVisibilityDidChange(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow, window.title == "Mantenimiento" else { return }
+        configureStatusRefreshTimer()
+    }
+
     private var effectiveStatusRefreshInterval: TimeInterval {
+        if NSApp.windows.contains(where: {
+            $0.title == "Mantenimiento" && $0.isVisible && !$0.isMiniaturized && $0.occlusionState.contains(.visible)
+        }) {
+            return max(AppPreferences.statusRefreshInterval, ProcessInfo.processInfo.isLowPowerModeEnabled ? 5 : 1.5)
+        }
         if !AppPreferences.showStatusItem {
             return 8
         }
-        if statusPopoverController?.isShown == true {
+        if statusPopoverController?.isShown == true || activeStatusMenu != nil {
             return min(AppPreferences.statusRefreshInterval, 1.5)
         }
         if ProcessInfo.processInfo.isLowPowerModeEnabled {
@@ -583,6 +635,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CleanModeControllerDel
         diagnosticsWindowController?.showWindow(nil)
         diagnosticsWindowController?.window?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+        DispatchQueue.main.async { [weak self] in
+            self?.diagnosticsWindowController?.window?.makeFirstResponder(nil)
+        }
 
         if let sectionRawValue {
             NotificationCenter.default.post(
@@ -601,6 +656,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CleanModeControllerDel
 
     @objc private func markFanManualControlTouched() {
         fanManualControlTouched = true
+        fanHeartbeatTimer?.invalidate()
+        let timer = Timer(timeInterval: 8, repeats: true) { [weak self] _ in self?.sendFanHeartbeat() }
+        RunLoop.main.add(timer, forMode: .common)
+        fanHeartbeatTimer = timer
+    }
+
+    @objc private func markFanAutomaticControlConfirmed() {
+        fanManualControlTouched = false
+        fanHeartbeatTimer?.invalidate()
+        fanHeartbeatTimer = nil
+        anomalousFanSamples = 0
+    }
+
+    private func sendFanHeartbeat() {
+        guard fanManualControlTouched, !isSendingFanHeartbeat, !isRestoringFans else { return }
+        isSendingFanHeartbeat = true
+        Task { @MainActor in
+            let succeeded = await Task.detached(priority: .utility) {
+                do { try PrivilegedFanTool.heartbeat(); return true }
+                catch { return false }
+            }.value
+            isSendingFanHeartbeat = false
+            if !succeeded { restoreFansToAutoIfNeeded(asynchronously: true, reason: "pérdida de supervisión") }
+        }
     }
 
     @objc private func preferencesDidChange() {
@@ -616,17 +695,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CleanModeControllerDel
     }
 
     @objc private func powerStateDidChange() {
-        configureStatusRefreshTimer()
+        let isLowPower = ProcessInfo.processInfo.isLowPowerModeEnabled
+        DispatchQueue.main.async { [weak self] in
+            EventLog.shared.record(.power, title: isLowPower ? "Modo de bajo consumo activado" : "Modo de bajo consumo desactivado")
+            self?.configureStatusRefreshTimer()
+        }
+    }
+
+    @objc private func thermalStateDidChange() {
+        let state = ProcessInfo.processInfo.thermalState
+        let severity: MaintenanceEvent.Severity = state == .critical ? .critical : state == .serious ? .warning : .info
+        EventLog.shared.record(
+            .thermal,
+            severity: severity,
+            title: "Estado térmico \(thermalStateDescription(state))",
+            detail: state.rawValue >= ProcessInfo.ThermalState.serious.rawValue
+                ? "macOS está limitando el rendimiento para enfriar el equipo."
+                : nil
+        )
     }
 
     @objc private func systemWillSleep() {
         statusRefreshTimer?.invalidate()
+        EventLog.shared.record(.system, title: "Reposo")
         restoreFansToAutoIfNeeded(asynchronously: true, reason: "suspensión del sistema")
     }
 
     @objc private func systemDidWake() {
+        EventLog.shared.record(.system, title: "Reactivación tras reposo")
         anomalousFanSamples = 0
-        TelemetryStore.shared.invalidateSMC()
+        TelemetryStore.shared.resetAfterWake()
         refreshMenuBarStatus(force: true)
         configureStatusRefreshTimer()
     }
@@ -653,7 +751,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CleanModeControllerDel
 
         isApplyingProfile = true
         updateStatusPopover()
-        Task {
+        Task { @MainActor in
             do {
                 try await PerformanceProfileService.apply(profile)
             } catch {
@@ -666,12 +764,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CleanModeControllerDel
             }
 
             await MainActor.run {
+                EventLog.shared.record(.fans, title: "Perfil \(profile.title) aplicado")
                 activeProfile = profile
                 isApplyingProfile = false
-                fanManualControlTouched = profile == .turbo
                 UserDefaults.standard.set(profile.refreshInterval, forKey: AppPreferenceKeys.statusRefreshInterval)
                 if profile == .turbo {
                     NotificationCenter.default.post(name: .fanManualControlDidSucceed, object: nil)
+                } else {
+                    markFanAutomaticControlConfirmed()
                 }
                 TelemetryStore.shared.invalidateSMC()
                 refreshMenuBarStatus(force: true)
@@ -686,28 +786,61 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CleanModeControllerDel
         }
 
         isRefreshingStatus = true
-        let previous = previousMenuBarSnapshot
-        let includeSMC = MenuBarSnapshot.shouldIncludeSMC(previous: previous, force: force)
-
-        Task {
-            let snapshot = await Task.detached(priority: .utility) {
-                MenuBarSnapshot.load(previous: previous, includeSMC: includeSMC, force: force)
+        Task { @MainActor in
+            _ = await Task.detached(priority: .utility) {
+                TelemetryStore.shared.snapshot(
+                    previousTelemetry: nil, includeSMC: true, fullTelemetry: true, force: force
+                )
             }.value
+            isRefreshingStatus = false
+            updateActiveStatusMenu()
+            updateStatusPopover()
+        }
+    }
 
-            await MainActor.run {
-                previousMenuBarSnapshot = snapshot
-                latestMenuBarSnapshot = snapshot
-                isRefreshingStatus = false
-                MaintenanceAlertMonitor.shared.process(snapshot: snapshot)
-                TelemetryHistoryRecorder.shared.record(snapshot: snapshot)
-                updateFanSafety(with: snapshot)
-                updateStatusItemVisibility()
-                updateActiveStatusMenu()
-                updateStatusPopover()
-                if let section = activeMenuSection {
-                    refreshDemandIfNeeded(for: section)
-                }
-            }
+    @objc private func telemetryDidUpdate(_ notification: Notification) {
+        guard let shared = notification.object as? SharedTelemetrySnapshot,
+              latestMenuBarSnapshot.map({ shared.date > $0.date }) ?? true else { return }
+        let snapshot = MenuBarSnapshot.make(shared: shared, previous: previousMenuBarSnapshot)
+        recordPowerTransitions(from: latestMenuBarSnapshot?.telemetry.battery, to: snapshot.telemetry.battery)
+        previousMenuBarSnapshot = snapshot
+        latestMenuBarSnapshot = snapshot
+        MaintenanceAlertMonitor.shared.process(snapshot: snapshot)
+        sampleRunawayProcessesIfNeeded()
+        TelemetryHistoryRecorder.shared.record(snapshot: snapshot)
+        updateFanSafety(with: snapshot)
+        updateStatusItemVisibility()
+        updateActiveStatusMenu()
+        updateStatusPopover()
+        if let section = activeMenuSection {
+            refreshDemandIfNeeded(for: section)
+        }
+    }
+
+    private func recordPowerTransitions(from previous: BatterySnapshot?, to current: BatterySnapshot?) {
+        guard let previous, let current else { return }
+        if !previous.externalConnected && current.externalConnected {
+            let adapter = current.adapter?.name ?? current.adapter?.watts.map { "\($0) W" }
+            EventLog.shared.record(.power, title: "Cargador conectado", detail: [adapter, "batería al \(current.percent)%"].compactMap { $0 }.joined(separator: " · "))
+        } else if previous.externalConnected && !current.externalConnected {
+            EventLog.shared.record(.power, title: "Cargador desconectado", detail: "Batería al \(current.percent)%")
+        } else if !previous.isCharged && current.isCharged && current.externalConnected {
+            EventLog.shared.record(.power, title: "Carga completa", detail: "Batería al \(current.percent)%")
+        }
+    }
+
+    private func sampleRunawayProcessesIfNeeded() {
+        guard AppPreferences.runawayProcessAlertsEnabled, !isSamplingRunawayProcesses else { return }
+        if let last = RunawayProcessDetector.shared.lastSampleDate, Date().timeIntervalSince(last) < 30 {
+            return
+        }
+        isSamplingRunawayProcesses = true
+        Task { @MainActor in
+            let entries = await Task.detached(priority: .utility) {
+                ProcessDemandSampler.shared.cpuEntries()
+            }.value
+            isSamplingRunawayProcesses = false
+            RunawayProcessDetector.shared.deliver(RunawayProcessDetector.shared.process(entries: entries))
         }
     }
 
@@ -757,8 +890,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CleanModeControllerDel
                 }
             ),
             onClose: { [weak self] in
-                self?.activeMenuRefreshTask?.cancel()
-                self?.activeMenuRefreshTask = nil
                 self?.activeMenuSection = nil
                 self?.configureStatusRefreshTimer()
             }
@@ -797,33 +928,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CleanModeControllerDel
         activeMenuHandles = session.handles
         refreshDemandIfNeeded(for: section, force: true)
         updateActiveStatusMenu()
-        activeMenuRefreshTask?.cancel()
-        activeMenuRefreshTask = Task { [weak self] in
-            while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(1.5))
-                guard let self else {
-                    return
-                }
-                await MainActor.run {
-                    guard self.activeMenuSection == section else {
-                        return
-                    }
-                    self.refreshMenuBarStatus()
-                    self.refreshDemandIfNeeded(for: section)
-                }
-            }
-        }
+        configureStatusRefreshTimer()
         session.menu.popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.height + 4), in: button)
-        activeMenuRefreshTask?.cancel()
-        activeMenuRefreshTask = nil
         activeStatusMenu = nil
         activeMenuSection = nil
         activeMenuHandles = nil
+        configureStatusRefreshTimer()
     }
 
     private func updateStatusPopover() {
         guard let controller = statusPopoverController,
-              controller.isShown,
               let section = activeMenuSection else {
             return
         }
@@ -895,7 +1009,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CleanModeControllerDel
         updateActiveStatusMenu()
         updateStatusPopover()
 
-        Task {
+        Task { @MainActor in
             let entries = await Task.detached(priority: .utility) { [self] in
                 loadDemandEntries(for: section)
             }.value
@@ -964,6 +1078,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CleanModeControllerDel
                 MenuInfoLine(title: "Memoria GPU", value: snapshot.telemetry.gpu?.inUseMemoryBytes.map(formatBytes) ?? "sin datos")
             ]
         case .memory:
+            guard snapshot.telemetry.memory.isAvailable else {
+                return [MenuInfoLine(title: "Estado", value: "Sin lectura de memoria fiable")]
+            }
             return [
                 MenuInfoLine(title: "Memoria usada", value: "\(formatBytes(snapshot.telemetry.memory.usedBytes)) / \(formatBytes(snapshot.telemetry.memory.totalBytes)) (\(formatPercent(snapshot.telemetry.memory.usedRatio)))"),
                 MenuInfoLine(title: "Memoria de apps", value: formatBytes(snapshot.telemetry.memory.appBytes)),
@@ -987,6 +1104,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CleanModeControllerDel
                 MenuInfoLine(title: "Carga", value: "\(battery.percent)%"),
                 MenuInfoLine(title: "Estado", value: batteryStatusDescription(battery))
             ]
+            if let minutes = battery.timeToFullMinutes ?? battery.timeToEmptyMinutes {
+                lines.append(MenuInfoLine(
+                    title: battery.timeToFullMinutes != nil ? "Llena en" : "Restante",
+                    value: formatBatteryMinutes(minutes)
+                ))
+            }
+            if let watts = battery.batteryPowerWatts, abs(watts) >= 0.1 {
+                lines.append(MenuInfoLine(title: watts > 0 ? "Carga" : "Descarga", value: String(format: "%.1f W", abs(watts))))
+            }
+            if let adapter = battery.adapter {
+                lines.append(MenuInfoLine(title: "Cargador", value: adapter.name ?? adapter.watts.map { "\($0) W" } ?? "conectado"))
+            }
             if let cycles = battery.cycleCount {
                 lines.append(MenuInfoLine(title: "Ciclos", value: "\(cycles)"))
             }
@@ -1005,6 +1134,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CleanModeControllerDel
     }
 
     private func updateFanSafety(with snapshot: MenuBarSnapshot) {
+        if fanManualControlTouched, snapshot.fanStatus.error != nil {
+            restoreFansToAutoIfNeeded(asynchronously: true, reason: "fallo de lectura de ventiladores")
+            return
+        }
+        guard snapshot.fanStatus.isCurrent,
+              snapshot.fanStatus.lastSuccess != lastFanSafetyDate else { return }
+        lastFanSafetyDate = snapshot.fanStatus.lastSuccess
+        if fanManualControlTouched, snapshot.fans?.isAutomaticControlConfirmed == true {
+            markFanAutomaticControlConfirmed()
+        }
         guard fanManualControlTouched,
               let fans = snapshot.fans?.fans,
               !fans.isEmpty else {
@@ -1023,30 +1162,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CleanModeControllerDel
     }
 
     private func restoreFansToAutoIfNeeded(asynchronously: Bool, reason: String) {
-        guard fanManualControlTouched else {
+        guard fanManualControlTouched, !isRestoringFans else {
             return
         }
-        fanManualControlTouched = false
-        anomalousFanSamples = 0
-        TelemetryStore.shared.invalidateSMC()
-
-        let operation = {
+        isRestoringFans = true
+        let operation = { () -> Bool in
             do {
-                try FanService.make().setAllFansAuto()
+                _ = try PrivilegedFanTool.setAllFansAuto()
+                appLogger.info("Fans restored to automatic mode: \(reason, privacy: .public)")
+                EventLog.shared.record(.fans, severity: .warning, title: "Ventiladores devueltos a automático", detail: "Motivo: \(reason).")
+                return true
             } catch {
-                guard PrivilegedFanTool.shouldRetryPrivileged(error) else {
-                    appLogger.error("Could not restore fans to automatic mode after \(reason, privacy: .public): \(error.localizedDescription, privacy: .public)")
-                    return
-                }
-                _ = try? PrivilegedFanTool.setAllFansAuto()
+                appLogger.error("Auto recovery still pending after \(reason, privacy: .public): \(error.localizedDescription, privacy: .public)")
+                return false
             }
-            appLogger.info("Fans restored to automatic mode: \(reason, privacy: .public)")
         }
-
         if asynchronously {
-            Task.detached(priority: .userInitiated, operation: operation)
+            Task { @MainActor in
+                let confirmed = await Task.detached(priority: .userInitiated, operation: operation).value
+                isRestoringFans = false
+                if confirmed { markFanAutomaticControlConfirmed() }
+                TelemetryStore.shared.invalidateSMC()
+            }
         } else {
-            operation()
+            let confirmed = operation()
+            isRestoringFans = false
+            if confirmed { markFanAutomaticControlConfirmed() }
         }
     }
 
@@ -1215,10 +1356,11 @@ private func gpuTime(_ nanoseconds: UInt64) -> String {
 }
 
 struct MenuBarSnapshot {
-    static let smcRefreshInterval: TimeInterval = 4.5
-
     let date: Date
+    let samplingEpoch: UInt64
     let smcDate: Date?
+    let fanStatus: TelemetryReadingStatus
+    let sensorStatus: TelemetryReadingStatus
     let thermalState: String
     let sensors: SensorSnapshot?
     let fans: FanSnapshot?
@@ -1327,28 +1469,15 @@ struct MenuBarSnapshot {
         return "\(gpu.model), \(detail)"
     }
 
-    static func shouldIncludeSMC(previous: MenuBarSnapshot?, force: Bool) -> Bool {
-        if force || previous?.sensors == nil {
-            return true
-        }
-        guard let smcDate = previous?.smcDate else {
-            return true
-        }
-        return Date().timeIntervalSince(smcDate) >= smcRefreshInterval
-    }
-
-    static func load(previous: MenuBarSnapshot?, includeSMC: Bool = false, force: Bool = false) -> MenuBarSnapshot {
-        let shared = TelemetryStore.shared.snapshot(
-            previousTelemetry: previous?.telemetry,
-            includeSMC: includeSMC,
-            fullTelemetry: includeSMC,
-            force: force
-        )
+    static func make(shared: SharedTelemetrySnapshot, previous: MenuBarSnapshot?) -> MenuBarSnapshot {
         let date = shared.date
+        let previous = previous.flatMap {
+            $0.samplingEpoch == shared.samplingEpoch && TelemetryContinuity.isContinuous(from: $0.date, to: date) ? $0 : nil
+        }
         let telemetry = shared.telemetry
-        let sensors = shared.sensors ?? previous?.sensors
-        let fans = shared.fans ?? previous?.fans
-        let smcDate = shared.smcDate ?? previous?.smcDate
+        let sensors = shared.sensorStatus.isCurrent ? shared.sensors : nil
+        let fans = shared.fanStatus.isCurrent ? shared.fans : nil
+        let smcDate = shared.smcDate
         let interval = previous.map { max(date.timeIntervalSince($0.date), 0.1) }
         let networkDownBps = computeRate(
             current: telemetry.network.totalReceivedBytes,
@@ -1360,21 +1489,16 @@ struct MenuBarSnapshot {
             previous: previous?.telemetry.network.totalSentBytes,
             interval: interval
         )
-        let diskReadBps = computeRate(
-            current: telemetry.diskIO.readBytes,
-            previous: previous?.telemetry.diskIO.readBytes,
-            interval: interval
-        )
-        let diskWriteBps = computeRate(
-            current: telemetry.diskIO.writtenBytes,
-            previous: previous?.telemetry.diskIO.writtenBytes,
-            interval: interval
-        )
+        let diskReadBps = shared.diskReadBps
+        let diskWriteBps = shared.diskWriteBps
         let cpuUsage = computeCPUUsage(current: telemetry.cpu, previous: previous?.telemetry.cpu)
 
         return MenuBarSnapshot(
             date: date,
+            samplingEpoch: shared.samplingEpoch,
             smcDate: smcDate,
+            fanStatus: shared.fanStatus,
+            sensorStatus: shared.sensorStatus,
             thermalState: thermalStateDescription(ProcessInfo.processInfo.thermalState),
             sensors: sensors,
             fans: fans,
@@ -1548,7 +1672,7 @@ private final class CompactStatusBarView: NSView {
             case .memory:
                 drawMetric(
                     label: "RAM",
-                    value: snapshot.map { formatPercent($0.telemetry.memory.usedRatio) } ?? "--",
+                    value: snapshot.flatMap { $0.telemetry.memory.isAvailable ? formatPercent($0.telemetry.memory.usedRatio) : nil } ?? "--",
                     temperature: compactTemperature(snapshot?.memoryTemperature),
                     x: cursor,
                     y: y
@@ -1785,7 +1909,7 @@ private func batteryStatusDescription(_ battery: BatterySnapshot) -> String {
         return "cargando"
     }
     if battery.externalConnected {
-        return "en corriente"
+        return battery.isChargingPaused ? "conectada, carga en pausa" : "en corriente"
     }
     return "en batería"
 }

@@ -14,7 +14,14 @@ RESOURCES_DIR="${CONTENTS_DIR}/Resources"
 HELPER_DIR="${CONTENTS_DIR}/Library/PrivilegedHelperTools"
 
 cd "${ROOT_DIR}"
-swift build -c "${BUILD_CONFIGURATION}"
+BUILD_OPTIONS=(-c "${BUILD_CONFIGURATION}")
+if [[ -n "${MACOS_SDK_PATH:-}" ]]; then
+    BUILD_OPTIONS+=(--sdk "${MACOS_SDK_PATH}")
+fi
+if [[ -n "${SWIFT_BUILD_SYSTEM:-}" ]]; then
+    BUILD_OPTIONS+=(--build-system "${SWIFT_BUILD_SYSTEM}")
+fi
+swift build "${BUILD_OPTIONS[@]}"
 
 rm -rf "${APP_DIR}"
 mkdir -p "${MACOS_DIR}" "${RESOURCES_DIR}" "${HELPER_DIR}"
@@ -46,9 +53,9 @@ cat > "${CONTENTS_DIR}/Info.plist" <<'PLIST'
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.2.0</string>
+    <string>0.3.5</string>
     <key>CFBundleVersion</key>
-    <string>2</string>
+    <string>8</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
     <key>LSApplicationCategoryType</key>
@@ -80,7 +87,7 @@ if [[ "${SIGN_IDENTITY}" == "-" ]]; then
         codesign --force --sign - "${MACOS_DIR}/mantenimiento-fanctl" >/dev/null
     fi
     if [[ -f "${HELPER_DIR}/local.marc.mantenimiento.helper" ]]; then
-        codesign --force --sign - "${HELPER_DIR}/local.marc.mantenimiento.helper" >/dev/null
+        codesign --force --sign - --identifier local.marc.mantenimiento.helper "${HELPER_DIR}/local.marc.mantenimiento.helper" >/dev/null
     fi
     codesign --force --sign - --requirements "${REQUIREMENTS_FILE}" "${APP_DIR}" >/dev/null
 else
@@ -95,7 +102,7 @@ else
         codesign "${SIGNING_OPTIONS[@]}" "${MACOS_DIR}/mantenimiento-fanctl" >/dev/null
     fi
     if [[ -f "${HELPER_DIR}/local.marc.mantenimiento.helper" ]]; then
-        codesign "${SIGNING_OPTIONS[@]}" "${HELPER_DIR}/local.marc.mantenimiento.helper" >/dev/null
+        codesign "${SIGNING_OPTIONS[@]}" --identifier local.marc.mantenimiento.helper "${HELPER_DIR}/local.marc.mantenimiento.helper" >/dev/null
     fi
     codesign "${SIGNING_OPTIONS[@]}" "${APP_DIR}" >/dev/null
 fi

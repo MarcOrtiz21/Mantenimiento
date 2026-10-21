@@ -65,9 +65,9 @@ public struct SensorSnapshot: Codable {
 }
 
 public final class SensorService {
-    private let connection: SMCConnection
+    private let connection: SMCTransport
 
-    public init(connection: SMCConnection) {
+    public init(connection: SMCTransport) {
         self.connection = connection
     }
 
@@ -75,20 +75,28 @@ public final class SensorService {
         SensorService(connection: try SMCConnection())
     }
 
-    public func snapshot() -> SensorSnapshot {
+    public func snapshot() throws -> SensorSnapshot {
+        var failedRead = false
         let readings = SensorCatalog.keysForCurrentHardware().compactMap { sensor -> SensorReading? in
-            guard let result = try? connection.readKey(sensor.key) else {
+            let result: (bytes: [UInt8], size: UInt32)
+            do { result = try connection.readKey(sensor.key) }
+            catch {
+                if case SMCError.firmware(.notFound) = error {} else { failedRead = true }
                 return nil
             }
 
             let value = SMCDataFormat.float(from: result.bytes, size: result.size)
             guard isPlausible(value: value, for: sensor.type) else {
+                failedRead = true
                 return nil
             }
 
             return SensorReading(sensor: sensor, value: value)
         }
 
+        guard !readings.isEmpty else {
+            throw failedRead ? SensorReadError.unavailable : SensorReadError.notSupported
+        }
         return SensorSnapshot(readings: readings)
     }
 
@@ -106,6 +114,16 @@ public final class SensorService {
             return value >= 0.05 && value < 500
         case .current:
             return value >= 0.05 && value < 300
+        }
+    }
+}
+
+public enum SensorReadError: LocalizedError {
+    case notSupported, unavailable
+    public var errorDescription: String? {
+        switch self {
+        case .notSupported: return "No se encontraron sensores compatibles con este equipo."
+        case .unavailable: return "Falló la lectura de los sensores; no hay datos actuales."
         }
     }
 }
@@ -206,30 +224,48 @@ public enum SensorCatalog {
         SensorKey(key: "Tm06", name: "Memory 2", group: .memory, type: .temperature),
     ]
 
+    public enum Platform: Equatable {
+        case m1, m2, m3, m4
+        case none
+    }
+
     public static func keysForCurrentHardware() -> [SensorKey] {
-        let model = hardwareModel()
-        let platformKeys: [SensorKey]
+        keys(for: platform(forProcessorBrand: sysctlString("machdep.cpu.brand_string")))
+    }
 
-        if model.hasPrefix("Mac16") {
-            platformKeys = m4
-        } else if model.hasPrefix("Mac15") || model.hasPrefix("Mac14") {
-            platformKeys = m3
-        } else if model.hasPrefix("Mac13") {
-            platformKeys = m2
-        } else if model.hasPrefix("Mac12") || model.hasPrefix("MacBookPro18") || model.hasPrefix("MacBookAir10") {
-            platformKeys = m1
-        } else {
-            platformKeys = []
+    /// Los identificadores `MacXX,Y` no siguen la generación del chip (Mac14 es M2, Mac13 es Mac Studio M1),
+    /// así que se usa el nombre comercial del procesador.
+    public static func platform(forProcessorBrand brand: String) -> Platform {
+        guard let match = brand.range(of: #"Apple M(\d+)"#, options: .regularExpression),
+              let generation = Int(brand[match].dropFirst("Apple M".count)) else {
+            return .none
         }
+        switch generation {
+        case 1: return .m1
+        case 2: return .m2
+        case 3: return .m3
+        default: return .m4
+        }
+    }
 
+    public static func keys(for platform: Platform) -> [SensorKey] {
+        let platformKeys: [SensorKey]
+        switch platform {
+        case .m1: platformKeys = m1
+        case .m2: platformKeys = m2
+        case .m3: platformKeys = m3
+        case .m4: platformKeys = m4
+        case .none: platformKeys = []
+        }
         return platformKeys + crossPlatform
     }
 
-    private static func hardwareModel() -> String {
+    private static func sysctlString(_ name: String) -> String {
         var size = 0
-        sysctlbyname("hw.model", nil, &size, nil, 0)
-        var model = [CChar](repeating: 0, count: size)
-        sysctlbyname("hw.model", &model, &size, nil, 0)
-        return String(decoding: model.prefix(while: { $0 != 0 }).map { UInt8($0) }, as: UTF8.self)
+        sysctlbyname(name, nil, &size, nil, 0)
+        guard size > 0 else { return "" }
+        var value = [CChar](repeating: 0, count: size)
+        sysctlbyname(name, &value, &size, nil, 0)
+        return String(decoding: value.prefix(while: { $0 != 0 }).map { UInt8(bitPattern: $0) }, as: UTF8.self)
     }
 }

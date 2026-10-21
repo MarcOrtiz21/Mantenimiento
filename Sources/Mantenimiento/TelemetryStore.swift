@@ -1,15 +1,52 @@
 import Foundation
 import MantenimientoCore
 
+extension Notification.Name {
+    static let telemetryUpdated = Notification.Name("local.marc.mantenimiento.telemetryUpdated")
+}
+
+struct TelemetryReadingStatus {
+    let lastSuccess: Date?
+    let error: String?
+    let referenceDate: Date
+
+    var isCurrent: Bool {
+        guard error == nil, let lastSuccess else { return false }
+        return referenceDate.timeIntervalSince(lastSuccess) <= 15
+    }
+
+    var description: String {
+        guard let lastSuccess else { return error == nil ? "Esperando lectura" : "Sin lecturas" }
+        let time = lastSuccess.formatted(date: .omitted, time: .standard)
+        return isCurrent ? "Actual · \(time)" : "Última válida · \(time)"
+    }
+}
+
 struct SharedTelemetrySnapshot {
     let date: Date
+    let samplingEpoch: UInt64
     let smcDate: Date?
     let telemetry: SystemTelemetrySnapshot
     let fans: FanSnapshot?
     let sensors: SensorSnapshot?
     let fanError: String?
     let sensorError: String?
+    let fanDate: Date?
+    let sensorDate: Date?
     let appResources: AppResourceSnapshot
+    let diskDate: Date
+    let diskReadBps: Double?
+    let diskWriteBps: Double?
+    var diskReadOpsPerSecond: Double?
+    var diskWriteOpsPerSecond: Double?
+
+    var fanStatus: TelemetryReadingStatus {
+        TelemetryReadingStatus(lastSuccess: fanDate, error: fanError, referenceDate: date)
+    }
+
+    var sensorStatus: TelemetryReadingStatus {
+        TelemetryReadingStatus(lastSuccess: sensorDate, error: sensorError, referenceDate: date)
+    }
 }
 
 final class TelemetryStore {
@@ -17,23 +54,45 @@ final class TelemetryStore {
 
     private let lock = NSLock()
     private let sampleLock = NSLock()
-    private var fullTelemetryInterval: TimeInterval {
-        ProcessInfo.processInfo.isLowPowerModeEnabled ? 8.0 : 4.5
+    private let clock: () -> Date
+    private let loadTelemetry: () -> SystemTelemetrySnapshot
+    private let loadStatus: (SystemTelemetrySnapshot?) -> SystemTelemetrySnapshot
+    private let loadFans: () throws -> FanSnapshot
+    private let loadSensors: () throws -> SensorSnapshot
+    private let loadResources: () -> AppResourceSnapshot
+    private var latestSnapshot: SharedTelemetrySnapshot?
+    private var fullTelemetryDate: Date?
+    private var lastSMCAttempt: Date?
+    private var smcInvalidationGeneration: UInt64 = 0
+    private var loadedSMCGeneration: UInt64 = 0
+    private var samplingEpoch: UInt64 = 0
+    private var loadedSamplingEpoch: UInt64 = 0
+
+    private var slowInterval: TimeInterval {
+        ProcessInfo.processInfo.isLowPowerModeEnabled ? 8 : 4.5
     }
 
-    private var smcInterval: TimeInterval {
-        ProcessInfo.processInfo.isLowPowerModeEnabled ? 8.0 : 4.5
+    init(
+        clock: @escaping () -> Date = Date.init,
+        loadTelemetry: @escaping () -> SystemTelemetrySnapshot = SystemTelemetryService.snapshot,
+        loadStatus: @escaping (SystemTelemetrySnapshot?) -> SystemTelemetrySnapshot = { SystemTelemetryService.statusSnapshot(previous: $0) },
+        loadFans: @escaping () throws -> FanSnapshot = { try FanService.make().snapshot() },
+        loadSensors: @escaping () throws -> SensorSnapshot = { try SensorService.make().snapshot() },
+        loadResources: @escaping () -> AppResourceSnapshot = { AppResourceMonitor.shared.snapshot() }
+    ) {
+        self.clock = clock
+        self.loadTelemetry = loadTelemetry
+        self.loadStatus = loadStatus
+        self.loadFans = loadFans
+        self.loadSensors = loadSensors
+        self.loadResources = loadResources
     }
 
-    private var cachedTelemetry: SystemTelemetrySnapshot?
-    private var cachedTelemetryDate: Date?
-    private var cachedFans: FanSnapshot?
-    private var cachedFanError: String?
-    private var cachedSensors: SensorSnapshot?
-    private var cachedSensorError: String?
-    private var cachedSMCDate: Date?
-
-    private init() {}
+    var latest: SharedTelemetrySnapshot? {
+        lock.lock()
+        defer { lock.unlock() }
+        return latestSnapshot
+    }
 
     func snapshot(
         previousTelemetry: SystemTelemetrySnapshot?,
@@ -41,100 +100,121 @@ final class TelemetryStore {
         fullTelemetry: Bool,
         force: Bool = false
     ) -> SharedTelemetrySnapshot {
-        // Serializa las lecturas de SMC cuando ventana y barra refrescan a la vez.
+        // Reutiliza la misma muestra si dos consumidores coinciden al iniciar o abrir un panel.
         sampleLock.lock()
         defer { sampleLock.unlock() }
-
-        let date = Date()
-        let state = cachedState()
-        let shouldLoadFullTelemetry = force
-            || fullTelemetry
-            || state.telemetry == nil
-            || state.telemetryDate.map { date.timeIntervalSince($0) >= fullTelemetryInterval } != false
-        let shouldLoadSMC = includeSMC
-            && (force || state.smcDate == nil || state.smcDate.map { date.timeIntervalSince($0) >= smcInterval } != false)
-
-        let telemetry: SystemTelemetrySnapshot
-        if shouldLoadFullTelemetry {
-            telemetry = SystemTelemetryService.snapshot()
-        } else if let previousTelemetry = state.telemetry ?? previousTelemetry {
-            telemetry = SystemTelemetryService.statusSnapshot(previous: previousTelemetry)
-        } else {
-            telemetry = SystemTelemetryService.statusSnapshot()
+        let date = clock()
+        let previous = latest
+        lock.lock()
+        let generation = smcInvalidationGeneration
+        let epoch = samplingEpoch
+        lock.unlock()
+        let samplingRestarted = epoch != loadedSamplingEpoch
+        if samplingRestarted {
+            fullTelemetryDate = nil
+            lastSMCAttempt = nil
+            loadedSamplingEpoch = epoch
+        }
+        let smcInvalidated = generation != loadedSMCGeneration
+        if !force, !samplingRestarted, let previous, date.timeIntervalSince(previous.date) < 1,
+           (!includeSMC || (lastSMCAttempt != nil && !smcInvalidated)),
+           (!fullTelemetry || fullTelemetryDate != nil) {
+            return previous
         }
 
-        let fanResult: Result<FanSnapshot, Error>? = shouldLoadSMC
-            ? Result { try FanService.make().snapshot() }
-            : nil
-        let sensorResult: Result<SensorSnapshot, Error>? = shouldLoadSMC
-            ? Result { try SensorService.make().snapshot() }
-            : nil
+        let previousDiskDate = fullTelemetryDate
+        let shouldLoadFull = force || fullTelemetryDate == nil
+            || fullTelemetryDate.map { date.timeIntervalSince($0) >= slowInterval } == true
+        let telemetry = shouldLoadFull
+            ? loadTelemetry()
+            : loadStatus(previous?.telemetry ?? previousTelemetry)
+        if shouldLoadFull { fullTelemetryDate = date }
+        let diskReadBps = shouldLoadFull
+            ? Self.counterRate(telemetry.diskIO.readBytes, previous?.telemetry.diskIO.readBytes, date, previousDiskDate)
+            : previous?.diskReadBps
+        let diskWriteBps = shouldLoadFull
+            ? Self.counterRate(telemetry.diskIO.writtenBytes, previous?.telemetry.diskIO.writtenBytes, date, previousDiskDate)
+            : previous?.diskWriteBps
+        let diskReadOps = shouldLoadFull
+            ? Self.counterRate(telemetry.diskIO.readOperations, previous?.telemetry.diskIO.readOperations, date, previousDiskDate)
+            : previous?.diskReadOpsPerSecond
+        let diskWriteOps = shouldLoadFull
+            ? Self.counterRate(telemetry.diskIO.writeOperations, previous?.telemetry.diskIO.writeOperations, date, previousDiskDate)
+            : previous?.diskWriteOpsPerSecond
 
-        let fans = fanResult.flatMap { try? $0.get() } ?? state.fans
-        let sensors = sensorResult.flatMap { try? $0.get() } ?? state.sensors
-        let fanError = fanResult?.failureDescription ?? state.fanError
-        let sensorError = sensorResult?.failureDescription ?? state.sensorError
-        let smcDate = shouldLoadSMC ? date : state.smcDate
-        let appResources = AppResourceMonitor.shared.snapshot()
+        var fans = previous?.fans
+        var sensors = previous?.sensors
+        var fanError = previous?.fanError
+        var sensorError = previous?.sensorError
+        var fanDate = previous?.fanDate
+        var sensorDate = previous?.sensorDate
+        let shouldLoadSMC = includeSMC
+            && (force || smcInvalidated || lastSMCAttempt == nil || lastSMCAttempt.map { date.timeIntervalSince($0) >= slowInterval } == true)
 
-        lock.lock()
-        cachedTelemetry = telemetry
-        cachedTelemetryDate = date
-        cachedFans = fans
-        cachedFanError = fanError
-        cachedSensors = sensors
-        cachedSensorError = sensorError
-        cachedSMCDate = smcDate
-        lock.unlock()
+        if shouldLoadSMC {
+            lastSMCAttempt = date
+            loadedSMCGeneration = generation
+            do {
+                fans = try loadFans()
+                fanDate = date
+                fanError = nil
+            } catch {
+                fanError = error.localizedDescription
+            }
+            do {
+                let reading = try loadSensors()
+                guard !reading.readings.isEmpty else { throw SensorReadError.unavailable }
+                sensors = reading
+                sensorDate = date
+                sensorError = nil
+            } catch {
+                sensorError = error.localizedDescription
+            }
+        }
 
-        return SharedTelemetrySnapshot(
+        var snapshot = SharedTelemetrySnapshot(
             date: date,
-            smcDate: smcDate,
+            samplingEpoch: epoch,
+            smcDate: lastSMCAttempt,
             telemetry: telemetry,
             fans: fans,
             sensors: sensors,
             fanError: fanError,
             sensorError: sensorError,
-            appResources: appResources
+            fanDate: fanDate,
+            sensorDate: sensorDate,
+            appResources: loadResources(),
+            diskDate: fullTelemetryDate ?? date,
+            diskReadBps: diskReadBps,
+            diskWriteBps: diskWriteBps
         )
+        snapshot.diskReadOpsPerSecond = diskReadOps
+        snapshot.diskWriteOpsPerSecond = diskWriteOps
+        lock.lock()
+        latestSnapshot = snapshot
+        lock.unlock()
+        DispatchQueue.main.async {
+            NotificationCenter.default.post(name: .telemetryUpdated, object: snapshot)
+        }
+        return snapshot
     }
 
     func invalidateSMC() {
         lock.lock()
-        cachedSMCDate = nil
-        lock.unlock()
+        defer { lock.unlock() }
+        smcInvalidationGeneration &+= 1
     }
 
-    private func cachedState() -> CachedState {
+    func resetAfterWake() {
         lock.lock()
         defer { lock.unlock() }
-        return CachedState(
-            telemetry: cachedTelemetry,
-            telemetryDate: cachedTelemetryDate,
-            fans: cachedFans,
-            fanError: cachedFanError,
-            sensors: cachedSensors,
-            sensorError: cachedSensorError,
-            smcDate: cachedSMCDate
-        )
+        samplingEpoch &+= 1
+        smcInvalidationGeneration &+= 1
     }
-}
 
-private struct CachedState {
-    let telemetry: SystemTelemetrySnapshot?
-    let telemetryDate: Date?
-    let fans: FanSnapshot?
-    let fanError: String?
-    let sensors: SensorSnapshot?
-    let sensorError: String?
-    let smcDate: Date?
-}
-
-private extension Result {
-    var failureDescription: String? {
-        if case .failure(let error) = self {
-            return error.localizedDescription
-        }
-        return nil
+    static func counterRate(_ current: UInt64, _ previous: UInt64?, _ date: Date, _ previousDate: Date?) -> Double? {
+        guard let previous, let previousDate, current >= previous,
+              TelemetryContinuity.isContinuous(from: previousDate, to: date) else { return nil }
+        return Double(current - previous) / date.timeIntervalSince(previousDate)
     }
 }

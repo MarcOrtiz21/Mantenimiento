@@ -31,6 +31,11 @@ let package = Package(
             name: "MantenimientoHelper",
             dependencies: ["MantenimientoCore"],
             path: "Sources/MantenimientoHelper"
+        ),
+        .testTarget(
+            name: "MantenimientoTests",
+            dependencies: ["Mantenimiento", "MantenimientoCore"],
+            path: "Tests/MantenimientoTests"
         )
     ]
 )

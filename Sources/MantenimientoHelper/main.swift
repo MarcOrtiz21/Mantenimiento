@@ -54,7 +54,8 @@ private struct HelperConfig {
             }
         }
 
-        guard !clientCertificateSHA1.isEmpty else {
+        guard clientCertificateSHA1.count == 40, clientCertificateSHA1.allSatisfy({ $0.isHexDigit }),
+              clientIdentifier == "local.marc.mantenimiento" else {
             throw HelperError.missingClientRequirement
         }
         return HelperConfig(
@@ -69,12 +70,28 @@ private struct HelperConfig {
 
 private final class HelperServer {
     private let config: HelperConfig
+    private let controlQueue = DispatchQueue(label: "local.marc.mantenimiento.helper.control")
+    private let clients = DispatchSemaphore(value: 8)
+    private var watchdog: DispatchSourceTimer?
+    private var lease = ManualFanLease()
+    private let recoveryPath = "/var/run/local.marc.mantenimiento.helper.manual"
+    private var recoveryPending = false
+    private var responses: [UUID: (FanHelperRequest.Command, String)] = [:]
+    private var responseOrder: [UUID] = []
 
     init(config: HelperConfig) {
         self.config = config
     }
 
     func run() throws {
+        guard geteuid() == 0 else { throw HelperError.posix("root required") }
+        let timer = DispatchSource.makeTimerSource(queue: controlQueue)
+        timer.setEventHandler { [weak self] in self?.checkLease() }
+        timer.schedule(deadline: .distantFuture)
+        timer.resume()
+        watchdog = timer
+        recoveryPending = FileManager.default.fileExists(atPath: recoveryPath)
+        if recoveryPending { controlQueue.async { self.recoverControl() } }
         let serverFD = socket(AF_UNIX, SOCK_STREAM, 0)
         guard serverFD >= 0 else {
             throw HelperError.posix("socket")
@@ -96,16 +113,18 @@ private final class HelperServer {
             throw HelperError.posix("bind")
         }
 
-        chown(config.socketPath, config.ownerUID, gid_t.max)
-        chmod(config.socketPath, S_IRUSR | S_IWUSR)
+        guard chown(config.socketPath, config.ownerUID, gid_t.max) == 0,
+              chmod(config.socketPath, S_IRUSR | S_IWUSR) == 0 else { throw HelperError.posix("socket permissions") }
 
         guard listen(serverFD, 8) == 0 else {
             throw HelperError.posix("listen")
         }
 
         while true {
+            clients.wait()
             let clientFD = accept(serverFD, nil, nil)
             guard clientFD >= 0 else {
+                clients.signal()
                 continue
             }
 
@@ -116,7 +135,11 @@ private final class HelperServer {
     }
 
     private func handle(clientFD: Int32) {
-        defer { close(clientFD) }
+        defer { close(clientFD); clients.signal() }
+        var noSIGPIPE: Int32 = 1
+        setsockopt(clientFD, SOL_SOCKET, SO_NOSIGPIPE, &noSIGPIPE, socklen_t(MemoryLayout<Int32>.size))
+        var sendTimeout = timeval(tv_sec: 2, tv_usec: 0)
+        setsockopt(clientFD, SOL_SOCKET, SO_SNDTIMEO, &sendTimeout, socklen_t(MemoryLayout<timeval>.size))
 
         var peerUID: uid_t = 0
         var peerGID: gid_t = 0
@@ -131,9 +154,9 @@ private final class HelperServer {
         }
 
         do {
-            let command = try readCommand(from: clientFD)
-            let response = try execute(command)
-            writeLine("OK \(response)", to: clientFD)
+            let request = try FanHelperRequest.parse(readCommand(from: clientFD))
+            let response = controlQueue.sync { process(request, pid: peerPID) }
+            writeLine(response, to: clientFD)
         } catch {
             writeLine("ERR \(error.localizedDescription)", to: clientFD)
         }
@@ -211,45 +234,94 @@ private final class HelperServer {
         return command
     }
 
-    private func execute(_ command: String) throws -> String {
-        let parts = command.split(separator: " ").map(String.init)
-        guard let name = parts.first else {
-            throw HelperError.invalidCommand
+    private func process(_ request: FanHelperRequest, pid: pid_t) -> String {
+        if let id = request.id, let cached = responses[id] {
+            return cached.0 == request.command ? cached.1 : "ERR request ID reused"
         }
+        let response: String
+        do { response = "OK \(try execute(request.command, pid: pid))" }
+        catch { response = "ERR \(error.localizedDescription)" }
+        if let id = request.id {
+            responses[id] = (request.command, response)
+            responseOrder.append(id)
+            if responseOrder.count > 64 { responses.removeValue(forKey: responseOrder.removeFirst()) }
+        }
+        return response
+    }
 
-        let service = try FanService.make()
-
-        switch name {
-        case "ping":
-            return "pong"
-
-        case "turbo":
-            try service.setAllFansToMaximum()
-            return "turbo"
-
-        case "auto-all":
-            try service.setAllFansAuto()
-            return "auto-all"
-
-        case "set" where parts.count == 3:
-            guard let index = Int(parts[1]), index >= 0,
-                  let rpm = Float(parts[2]), rpm.isFinite, rpm > 0
-            else {
+    private func execute(_ command: FanHelperRequest.Command, pid: pid_t) throws -> String {
+        switch command {
+        case .ping: return FanHelperProtocol.greeting
+        case .heartbeat:
+            guard lease.renew(pid: pid, now: ProcessInfo.processInfo.systemUptime) else {
                 throw HelperError.invalidCommand
             }
-            _ = try service.setFanRPM(index: index, rpm: rpm)
-            return "set \(index) \(Int(rpm))"
-
-        case "auto" where parts.count == 2:
-            guard let index = Int(parts[1]), index >= 0 else {
-                throw HelperError.invalidCommand
-            }
-            try service.setFanAuto(index: index)
-            return "auto \(index)"
-
-        default:
-            throw HelperError.invalidCommand
+            return "heartbeat"
+        default: break
         }
+        if command.changesManualControl {
+            guard !recoveryPending, lease.ownerPID == nil || lease.ownerPID == pid else {
+                throw HelperError.controlBusy
+            }
+            // El marcador persiste si el helper cae antes de confirmar Auto.
+            try Data("manual\n".utf8).write(to: URL(fileURLWithPath: recoveryPath), options: .atomic)
+            guard chmod(recoveryPath, S_IRUSR | S_IWUSR) == 0 else { throw HelperError.posix("recovery marker") }
+            lease.begin(pid: pid, now: ProcessInfo.processInfo.systemUptime)
+            armWatchdog()
+        }
+        do {
+            let service = try FanService.make()
+            switch command {
+            case .turbo: try service.setAllFansToMaximum()
+            case .set(let index, let rpm): _ = try service.setFanRPM(index: index, rpm: rpm)
+            case .autoAll:
+                try service.setAllFansAuto()
+                try clearRecoveryMarker()
+            case .auto(let index):
+                try service.setFanAuto(index: index)
+                if try service.snapshot().isAutomaticControlConfirmed {
+                    try clearRecoveryMarker()
+                }
+            default: break
+            }
+            if command.changesManualControl { lease.begin(pid: pid, now: ProcessInfo.processInfo.systemUptime) }
+            return "applied"
+        } catch {
+            recoveryPending = true
+            recoverControl()
+            throw error
+        }
+    }
+
+    private func armWatchdog() {
+        watchdog?.schedule(deadline: .now() + 3, repeating: 3, leeway: .seconds(1))
+    }
+
+    private func checkLease() {
+        let isAlive = lease.ownerPID.map { kill($0, 0) == 0 } ?? false
+        if recoveryPending || lease.needsRecovery(now: ProcessInfo.processInfo.systemUptime, ownerIsAlive: isAlive) {
+            recoverControl()
+        }
+    }
+
+    private func recoverControl() {
+        do {
+            try FanService.make().setAllFansAuto()
+            try clearRecoveryMarker()
+        } catch {
+            recoveryPending = true
+            watchdog?.schedule(deadline: .now() + 10, repeating: 10, leeway: .seconds(2))
+            fputs("Auto recovery pending: \(error.localizedDescription)\n", stderr)
+        }
+    }
+
+    private func clearRecoveryMarker() throws {
+        if FileManager.default.fileExists(atPath: recoveryPath) {
+            try FileManager.default.removeItem(atPath: recoveryPath)
+        }
+        recoveryPending = false
+        lease.clear()
+        watchdog?.schedule(deadline: .distantFuture)
     }
 
     private func writeLine(_ line: String, to fd: Int32) {
@@ -284,6 +356,7 @@ private final class HelperServer {
 }
 
 private enum HelperError: LocalizedError {
+    case controlBusy
     case invalidCommand
     case missingClientRequirement
     case pathTooLong
@@ -293,6 +366,7 @@ private enum HelperError: LocalizedError {
 
     var errorDescription: String? {
         switch self {
+        case .controlBusy: return "Control ocupado o pendiente de recuperación a Auto."
         case .invalidCommand:
             return "Comando invalido."
         case .missingClientRequirement:
