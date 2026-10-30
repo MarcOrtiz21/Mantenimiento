@@ -10,6 +10,19 @@ extension DiagnosticsRootView {
             if let battery = snapshot.telemetry.battery {
                 batteryPanel(battery)
                 powerFlowPanel(battery)
+            }
+
+            SectionPanel(title: "Puertos USB-C", symbol: "cable.connector") {
+                USBCPortsView(
+                    ports: snapshot.telemetry.battery?.ports ?? [],
+                    devices: snapshot.telemetry.usbDevices,
+                    adapter: snapshot.telemetry.battery?.adapter
+                )
+            }
+
+            powerSensorsPanel(power)
+
+            if snapshot.telemetry.battery != nil {
                 SectionPanel(title: "Salud a largo plazo", symbol: "chart.line.downtrend.xyaxis") {
                     BatteryHealthTrendView(entries: batteryHealthEntries)
                 }
@@ -18,7 +31,10 @@ extension DiagnosticsRootView {
             SectionPanel(title: "Consumo por aplicación", symbol: "leaf") {
                 AppEnergyUsageList(usage: appEnergyUsage, isSampling: isSamplingEnergy)
             }
+        }
+    }
 
+    func powerSensorsPanel(_ power: [SensorReading]) -> some View {
             SectionPanel(title: "Sensores de potencia", symbol: "bolt") {
                 ResponsiveChartGrid(charts: [
                     SparklineChartView(
@@ -48,7 +64,6 @@ extension DiagnosticsRootView {
                     )
                 }
             }
-        }
     }
 
     func batteryPanel(_ battery: BatterySnapshot) -> some View {

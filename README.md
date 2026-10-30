@@ -35,6 +35,7 @@ El proyecto combina una ventana de diagnostico completa con un indicador compact
 - Salud de la batería a largo plazo: una medición diaria de la capacidad real para ver su evolución y la pérdida cada 100 ciclos.
 - Batería: capacidad real y de diseño en mAh, ciclos sobre los de diseño, condición, voltaje, amperaje, potencia de carga o descarga, tiempo restante, carga en pausa y datos del cargador.
 - Flujo de energía: potencia de entrada del cargador frente al consumo del sistema.
+- Puertos USB-C: contrato USB Power Delivery del cargador (voltaje, corriente, vatios y voltajes que ofrece) y dispositivos a los que el Mac da corriente (iPad, iPhone…) con su batería y la potencia reservada. Las conexiones y desconexiones quedan en Actividad. Apple Silicon no expone el voltaje ni la corriente reales de cada puerto; para eso hace falta un medidor USB-C físico.
 - Icono de batería en la barra lateral que refleja el nivel y muestra el rayo al cargar.
 - Seguridad del sistema: SIP, FileVault, Gatekeeper y firewall.
 - Revisión de mantenimiento en el resumen: espacio en disco, días encendido, memoria, swap, batería y seguridad.

@@ -85,6 +85,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CleanModeControllerDel
     private var isSendingFanHeartbeat = false
     private var isRestoringFans = false
     private var isSamplingRunawayProcesses = false
+    private var knownUSBDevices: [Int: USBPowerDevice]?
 
     func applicationWillFinishLaunching(_ notification: Notification) {
         AlertNotificationService.shared.configure()
@@ -804,6 +805,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CleanModeControllerDel
         let snapshot = MenuBarSnapshot.make(shared: shared, previous: previousMenuBarSnapshot)
         recordPowerTransitions(from: latestMenuBarSnapshot?.telemetry.battery, to: snapshot.telemetry.battery)
         BatteryHealthLog.shared.recordIfNeeded(snapshot.telemetry.battery)
+        recordUSBDeviceChanges(snapshot.telemetry)
         previousMenuBarSnapshot = snapshot
         latestMenuBarSnapshot = snapshot
         MaintenanceAlertMonitor.shared.process(snapshot: snapshot)
@@ -827,6 +829,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CleanModeControllerDel
             EventLog.shared.record(.power, title: "Cargador desconectado", detail: "Batería al \(current.percent)%")
         } else if !previous.isCharged && current.isCharged && current.externalConnected {
             EventLog.shared.record(.power, title: "Carga completa", detail: "Batería al \(current.percent)%")
+        }
+    }
+
+    /// Las muestras ligeras reutilizan la lista anterior; solo las completas (con volúmenes) sirven de referencia.
+    private func recordUSBDeviceChanges(_ telemetry: SystemTelemetrySnapshot) {
+        guard !telemetry.volumes.isEmpty else { return }
+        let current = Dictionary(telemetry.usbDevices.map { ($0.locationID, $0) }, uniquingKeysWith: { first, _ in first })
+        defer { knownUSBDevices = current }
+        guard let known = knownUSBDevices else { return }
+
+        for (location, device) in current where known[location] == nil {
+            let battery = telemetry.battery?.ports.first { $0.role == .poweringDevice && $0.deviceVendorID == device.vendorID }?.deviceBatteryPercent
+            EventLog.shared.record(
+                .power,
+                title: "\(device.name) conectado",
+                detail: [String(format: "hasta %.0f W", device.allocatedWatts), battery.map { "batería al \($0)%" }].compactMap { $0 }.joined(separator: " · ")
+            )
+        }
+        for (location, device) in known where current[location] == nil {
+            EventLog.shared.record(.power, title: "\(device.name) desconectado")
         }
     }
 

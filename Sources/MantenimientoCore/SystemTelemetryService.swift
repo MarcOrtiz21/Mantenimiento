@@ -14,6 +14,7 @@ public struct SystemTelemetrySnapshot: Codable {
     public let battery: BatterySnapshot?
     public let network: NetworkSnapshot
     public var volumes: [VolumeSnapshot] = []
+    public var usbDevices: [USBPowerDevice] = []
 }
 
 public struct CPUSnapshot: Codable {
@@ -183,6 +184,7 @@ public struct BatterySnapshot: Codable {
     public var systemLoadMilliwatts: Int?
     public var notChargingReason: Int?
     public var condition: String?
+    public var ports: [USBCPortSnapshot] = []
 
     public var healthPercent: Int? {
         guard let designCapacity, let maxCapacity, designCapacity > 0 else {
@@ -218,6 +220,43 @@ public struct PowerAdapterSnapshot: Codable {
     public let currentMilliamps: Int?
     public let manufacturer: String?
     public let isWireless: Bool
+}
+
+/// Estado de un puerto USB-C según el controlador de puertos; el índice sigue el orden de AppleSmartBattery.
+public struct USBCPortSnapshot: Codable, Identifiable, Equatable {
+    public enum Role: String, Codable {
+        case charger
+        case poweringDevice
+        case idle
+    }
+
+    public var id: Int { index }
+    public let index: Int
+    public let role: Role
+    public let contractVoltageMillivolts: Int?
+    public let contractCurrentMilliamps: Int?
+    public let maxPowerMilliwatts: Int?
+    public let offeredVoltagesMillivolts: [Int]
+    public let deviceVendorID: Int?
+    public let deviceBatteryPercent: Int?
+
+    public var contractWatts: Double? {
+        guard let contractVoltageMillivolts, let contractCurrentMilliamps else { return nil }
+        return Double(contractVoltageMillivolts) * Double(contractCurrentMilliamps) / 1_000_000
+    }
+}
+
+/// Dispositivo USB al que el Mac reserva corriente (a 5 V salvo contrato USB-PD).
+public struct USBPowerDevice: Codable, Identifiable, Equatable {
+    public var id: Int { locationID }
+    public let locationID: Int
+    public let name: String
+    public let vendor: String?
+    public let vendorID: Int?
+    public let allocatedMilliamps: Int
+    public let capabilityMilliamps: Int?
+
+    public var allocatedWatts: Double { Double(allocatedMilliamps) * 5 / 1_000 }
 }
 
 public struct NetworkSnapshot: Codable {
@@ -318,7 +357,8 @@ public enum SystemTelemetryService {
             diskIO: diskIOSnapshot(),
             battery: batterySnapshot(),
             network: networkSnapshot(),
-            volumes: volumeSnapshots()
+            volumes: volumeSnapshots(),
+            usbDevices: usbPowerDevices()
         )
     }
 
@@ -332,7 +372,8 @@ public enum SystemTelemetryService {
             diskIO: previous?.diskIO ?? DiskIOSnapshot(readBytes: 0, writtenBytes: 0, readOperations: 0, writeOperations: 0),
             battery: previous?.battery,
             network: networkSnapshot(),
-            volumes: previous?.volumes ?? []
+            volumes: previous?.volumes ?? [],
+            usbDevices: previous?.usbDevices ?? []
         )
     }
 
@@ -696,7 +737,86 @@ public enum SystemTelemetryService {
         }
         snapshot.systemLoadMilliwatts = positiveInt(telemetry?["SystemLoad"])
         snapshot.condition = batteryCondition()
+        snapshot.ports = usbcPorts(
+            info: (properties["PortControllerInfo"] as? [[String: Any]]) ?? [],
+            fed: (properties["FedDetails"] as? [[String: Any]]) ?? []
+        )
         return snapshot
+    }
+
+    /// Decodifica el contrato USB-PD de cada puerto (RDO + lista de PDO) y los datos del aparato alimentado.
+    public static func usbcPorts(info: [[String: Any]], fed: [[String: Any]]) -> [USBCPortSnapshot] {
+        (0..<max(info.count, fed.count)).map { index in
+            let port = index < info.count ? info[index] : [:]
+            let device = index < fed.count ? fed[index] : [:]
+            let rdo = intValue(port["PortControllerActiveContractRdo"]) ?? 0
+            let pdos = ((port["PortControllerPortPDO"] as? [Any]) ?? []).compactMap { intValue($0) }
+            let fixedVoltages = pdos.map(fixedPDOVoltage)
+            let position = (rdo >> 28) & 0x7
+
+            var voltage: Int?
+            var current: Int?
+            if rdo != 0, position >= 1, position <= fixedVoltages.count, let fixed = fixedVoltages[position - 1] {
+                voltage = fixed
+                current = ((rdo >> 10) & 0x3FF) * 10
+            }
+
+            let maxPower = intValue(port["PortControllerMaxPower"]).flatMap { $0 > 0 ? $0 : nil }
+            let role: USBCPortSnapshot.Role
+            if intValue(device["FedExternalConnected"]) == 1 || maxPower != nil {
+                role = .charger
+            } else if intValue(device["FedPortPowerRole"]) == 1 {
+                role = .poweringDevice
+            } else {
+                role = .idle
+            }
+            let hasBattery = (intValue(device["FedDesignCapacity"]) ?? 0) > 0
+
+            return USBCPortSnapshot(
+                index: index,
+                role: role,
+                contractVoltageMillivolts: voltage,
+                contractCurrentMilliamps: current,
+                maxPowerMilliwatts: maxPower,
+                offeredVoltagesMillivolts: fixedVoltages.compactMap { $0 },
+                deviceVendorID: intValue(device["FedVendorID"]).flatMap { $0 > 0 ? $0 : nil },
+                deviceBatteryPercent: role == .poweringDevice && hasBattery ? intValue(device["FedStateOfCharge"]) : nil
+            )
+        }
+    }
+
+    /// PDO de tensión fija: tipo 00 en los bits 30-31 y tensión en unidades de 50 mV en los bits 10-19.
+    private static func fixedPDOVoltage(_ pdo: Int) -> Int? {
+        guard pdo != 0, (pdo >> 30) & 0x3 == 0 else { return nil }
+        let millivolts = ((pdo >> 10) & 0x3FF) * 50
+        return millivolts > 0 ? millivolts : nil
+    }
+
+    private static func usbPowerDevices() -> [USBPowerDevice] {
+        var iterator: io_iterator_t = 0
+        guard IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("IOUSBHostDevice"), &iterator) == KERN_SUCCESS else {
+            return []
+        }
+        defer { IOObjectRelease(iterator) }
+
+        var devices: [USBPowerDevice] = []
+        while case let service = IOIteratorNext(iterator), service != 0 {
+            defer { IOObjectRelease(service) }
+            guard let properties = serviceProperties(service),
+                  let allocation = intValue(properties["UsbPowerSinkAllocation"]), allocation > 0 else {
+                continue
+            }
+            let name = (properties["USB Product Name"] as? String) ?? (properties["kUSBProductString"] as? String) ?? "Dispositivo USB"
+            devices.append(USBPowerDevice(
+                locationID: intValue(properties["locationID"]) ?? devices.count,
+                name: name,
+                vendor: properties["USB Vendor Name"] as? String,
+                vendorID: intValue(properties["idVendor"]),
+                allocatedMilliamps: allocation,
+                capabilityMilliamps: intValue(properties["UsbPowerSinkCapability"])
+            ))
+        }
+        return devices.sorted { $0.allocatedMilliamps > $1.allocatedMilliamps }
     }
 
     private static func adapterSnapshot(_ details: [String: Any]?) -> PowerAdapterSnapshot? {

@@ -107,11 +107,35 @@ struct MaintenanceToolsTests {
         #expect(!item.isRunning)
     }
 
+    @Test func usbcPortsDecodeChargerContractAndPoweredDevice() {
+        let info: [[String: Any]] = [
+            ["PortControllerActiveContractRdo": 0, "PortControllerPortPDO": [0, 0], "PortControllerMaxPower": 0],
+            ["PortControllerActiveContractRdo": 1_090_999_765, "PortControllerPortPDO": [134_320_424, 184_617, 307_498, 410_069, 0], "PortControllerMaxPower": 93_800],
+            ["PortControllerActiveContractRdo": 0, "PortControllerPortPDO": [0], "PortControllerMaxPower": 0]
+        ]
+        let fed: [[String: Any]] = [
+            ["FedStateOfCharge": 90, "FedPortPowerRole": 1, "FedVendorID": 1452, "FedDesignCapacity": 300, "FedExternalConnected": 0],
+            ["FedStateOfCharge": 0, "FedPortPowerRole": 0, "FedVendorID": 0, "FedDesignCapacity": 0, "FedExternalConnected": 1],
+            ["FedStateOfCharge": 0, "FedPortPowerRole": 0, "FedVendorID": 0, "FedDesignCapacity": 0, "FedExternalConnected": 0]
+        ]
+
+        let ports = SystemTelemetryService.usbcPorts(info: info, fed: fed)
+
+        #expect(ports.map(\.role) == [.poweringDevice, .charger, .idle])
+        #expect(ports[0].deviceBatteryPercent == 90)
+        #expect(ports[0].deviceVendorID == 1452)
+        #expect(ports[1].contractVoltageMillivolts == 20_000)
+        #expect(ports[1].contractCurrentMilliamps == 4_690)
+        #expect(ports[1].offeredVoltagesMillivolts == [5_000, 9_000, 15_000, 20_000])
+        #expect(abs((ports[1].contractWatts ?? 0) - 93.8) < 0.01)
+        #expect(ports[2].deviceBatteryPercent == nil)
+    }
+
     @Test func batteryHealthLogStoresOneRowPerDay() throws {
         let folder = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: folder) }
         let log = BatteryHealthLog(fileURL: folder.appendingPathComponent("battery-health.csv"))
-        let json = #"{"percent":80,"isCharging":false,"isCharged":false,"externalConnected":true,"cycleCount":55,"designCapacity":6249,"maxCapacity":6296}"#
+        let json = #"{"percent":80,"isCharging":false,"isCharged":false,"externalConnected":true,"cycleCount":55,"designCapacity":6249,"maxCapacity":6296,"ports":[]}"#
         let battery = try JSONDecoder().decode(BatterySnapshot.self, from: Data(json.utf8))
 
         let day = Date(timeIntervalSince1970: 1_800_000_000)
