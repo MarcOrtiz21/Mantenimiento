@@ -642,12 +642,18 @@ public enum SystemTelemetryService {
             return nil
         }
 
+        let batteryData = properties["BatteryData"] as? [String: Any]
+        func capacityValue(_ key: String) -> Int? {
+            intValue(properties[key]) ?? intValue(batteryData?[key])
+        }
+
         let currentCapacity = intValue(properties["CurrentCapacity"])
         let maxCapacityPercent = intValue(properties["MaxCapacity"])
-        let rawCurrentCapacity = intValue(properties["AppleRawCurrentCapacity"])
-        let rawMaxCapacity = intValue(properties["AppleRawMaxCapacity"])
-            ?? intValue(properties["NominalChargeCapacity"])
-        let designCapacity = intValue(properties["DesignCapacity"])
+        let rawCurrentCapacity = capacityValue("AppleRawCurrentCapacity")
+        let rawMaxCapacity = capacityValue("AppleRawMaxCapacity")
+            ?? capacityValue("FullChargeCapacity")
+            ?? capacityValue("NominalChargeCapacity")
+        let designCapacity = capacityValue("DesignCapacity")
         let percent: Int
         if let currentCapacity, (0...100).contains(currentCapacity) {
             percent = currentCapacity
@@ -661,7 +667,6 @@ public enum SystemTelemetryService {
 
         let isCharging = boolValue(properties["IsCharging"])
         let externalConnected = boolValue(properties["ExternalConnected"])
-        let batteryData = properties["BatteryData"] as? [String: Any]
         let chargerData = properties["ChargerData"] as? [String: Any]
         let telemetry = properties["PowerTelemetryData"] as? [String: Any]
 

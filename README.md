@@ -29,6 +29,10 @@ El proyecto combina una ventana de diagnostico completa con un indicador compact
 - Tráfico por aplicación (TCP y UDP), actual y acumulado, agrupando los procesos auxiliares con su app.
 - Los túneles internos de macOS (iCloud, Continuidad, AirDrop) se agrupan aparte; las VPN con dirección propia se muestran como interfaces normales.
 - Disco de arranque con modelo, estado SMART y cifrado; actividad de lectura y escritura con operaciones por segundo; todos los volúmenes montados con uso y expulsión de los externos.
+- Qué ocupa espacio (bajo demanda y solo lectura): cachés, Descargas, papelera, copias de iPhone, datos de Xcode y simuladores, registros, adjuntos de Mail, archivos grandes en Descargas e instantáneas locales de Time Machine, con acceso directo al Finder. Nunca borra nada.
+- Arranque y segundo plano: LaunchAgents y LaunchDaemons instalados, con fabricante, si están en ejecución o desactivados y aviso de los que apuntan a programas que ya no existen.
+- Impacto energético por aplicación (la misma escala que Monitor de Actividad), agrupando los procesos auxiliares con su app.
+- Salud de la batería a largo plazo: una medición diaria de la capacidad real para ver su evolución y la pérdida cada 100 ciclos.
 - Batería: capacidad real y de diseño en mAh, ciclos sobre los de diseño, condición, voltaje, amperaje, potencia de carga o descarga, tiempo restante, carga en pausa y datos del cargador.
 - Flujo de energía: potencia de entrada del cargador frente al consumo del sistema.
 - Icono de batería en la barra lateral que refleja el nivel y muestra el rayo al cargar.
@@ -112,7 +116,8 @@ Sources/
 
 - `MantenimientoCore`: concentra el acceso a AppleSMC, sensores, ventiladores y snapshots de sistema.
 - `TelemetryStore`: serializa y comparte las muestras; conserva por separado las fechas del último éxito y los errores de sensores y ventiladores. Un temporizador alimenta ventana y barra. Los datos fallidos o antiguos no se usan como lecturas actuales.
-- `DiagnosticsWindowController`: ventana principal, navegacion lateral, graficas y acciones.
+- `DiagnosticsWindowController`: ventana principal, navegacion lateral, estado y acciones; cada sección vive en su propio archivo `Diagnostics*Section.swift` y los componentes compartidos en `DiagnosticsComponents.swift`.
+- `StorageAnalyzer`, `LaunchItemsScanner` y `BatteryHealthLog`: análisis de espacio, elementos de arranque y registro diario de la batería, todos de solo lectura salvo el propio registro.
 - `AppDelegate`: ciclo de vida, indicador de barra, menu contextual y restauracion de seguridad.
 - `PrivilegedHelperClient`: comunicacion limitada con el helper mediante socket local.
 - `MantenimientoHelper`: proceso separado con privilegios minimos para escribir objetivos SMC.
@@ -159,6 +164,7 @@ La aplicacion no necesita privilegios para consultar la mayoria de metricas. mac
 
 - **Accesibilidad** y **Monitorizacion de entrada** para el Modo Limpieza.
 - **Ubicación** solo si quieres ver el nombre de la red Wi-Fi; el resto de datos del Wi-Fi no lo necesita.
+- Acceso a **Descargas** al analizar el espacio, y **Acceso total al disco** si quieres medir también la papelera, las copias de iPhone o los adjuntos de Mail.
 - Autorizacion de administrador al instalar o actualizar el helper, nunca como reintento automático de una orden de ventiladores.
 
 El helper es opcional para consultar métricas y obligatorio para el control manual desde la app. Valida UID, PID, ruta y firma del cliente; limita conexiones y peticiones y serializa las operaciones SMC. La instalación verifica la copia del ejecutable en un directorio protegido de root, utilizando el mismo certificado de la app, y no ejecuta scripts temporales modificables por el usuario.
@@ -233,12 +239,15 @@ Se configura con macOS 15 y Xcode 16.4, disponibles en las [imágenes oficiales 
 Despues de construir el proyecto:
 
 ```bash
+.build/release/mantenimiento-fanctl status-json
 .build/release/mantenimiento-fanctl list-json
 .build/release/mantenimiento-fanctl sensors-json
 .build/release/mantenimiento-fanctl system-json
 .build/release/mantenimiento-fanctl auto-all
 .build/release/mantenimiento-fanctl turbo
 ```
+
+`status-json` devuelve un resumen compacto para scripts (CPU, carga, memoria, swap, disco, temperatura máxima, ventiladores, batería y estado térmico); las lecturas no disponibles se omiten.
 
 ## Helper privilegiado
 

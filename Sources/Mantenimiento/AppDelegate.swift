@@ -803,6 +803,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CleanModeControllerDel
               latestMenuBarSnapshot.map({ shared.date > $0.date }) ?? true else { return }
         let snapshot = MenuBarSnapshot.make(shared: shared, previous: previousMenuBarSnapshot)
         recordPowerTransitions(from: latestMenuBarSnapshot?.telemetry.battery, to: snapshot.telemetry.battery)
+        BatteryHealthLog.shared.recordIfNeeded(snapshot.telemetry.battery)
         previousMenuBarSnapshot = snapshot
         latestMenuBarSnapshot = snapshot
         MaintenanceAlertMonitor.shared.process(snapshot: snapshot)
@@ -1064,36 +1065,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CleanModeControllerDel
             return snapshot.detailLines
         case .cpu:
             return [
-                MenuInfoLine(title: "Uso total", value: snapshot.cpuUsage.map(formatPercent) ?? "calculando"),
+                MenuInfoLine(title: "Uso total", value: snapshot.cpuUsage.map(menuFormatPercent) ?? "calculando"),
                 MenuInfoLine(title: "Núcleos", value: "\(snapshot.telemetry.cpu.coreCount)"),
-                MenuInfoLine(title: "Temperatura CPU", value: snapshot.cpuTemperature.map(formatTemperature) ?? "sin datos"),
+                MenuInfoLine(title: "Temperatura CPU", value: snapshot.cpuTemperature.map(menuFormatTemperature) ?? "sin datos"),
                 MenuInfoLine(title: "Estado térmico", value: snapshot.thermalState)
             ]
         case .gpu:
             return [
                 MenuInfoLine(title: "Resumen", value: snapshot.gpuSummary),
-                MenuInfoLine(title: "Temperatura GPU", value: snapshot.gpuTemperature.map(formatTemperature) ?? "sin datos"),
+                MenuInfoLine(title: "Temperatura GPU", value: snapshot.gpuTemperature.map(menuFormatTemperature) ?? "sin datos"),
                 MenuInfoLine(title: "Renderer", value: snapshot.telemetry.gpu?.rendererUtilizationPercent.map { "\(Int($0.rounded()))%" } ?? "sin datos"),
                 MenuInfoLine(title: "Tiler", value: snapshot.telemetry.gpu?.tilerUtilizationPercent.map { "\(Int($0.rounded()))%" } ?? "sin datos"),
-                MenuInfoLine(title: "Memoria GPU", value: snapshot.telemetry.gpu?.inUseMemoryBytes.map(formatBytes) ?? "sin datos")
+                MenuInfoLine(title: "Memoria GPU", value: snapshot.telemetry.gpu?.inUseMemoryBytes.map(menuFormatBytes) ?? "sin datos")
             ]
         case .memory:
             guard snapshot.telemetry.memory.isAvailable else {
                 return [MenuInfoLine(title: "Estado", value: "Sin lectura de memoria fiable")]
             }
             return [
-                MenuInfoLine(title: "Memoria usada", value: "\(formatBytes(snapshot.telemetry.memory.usedBytes)) / \(formatBytes(snapshot.telemetry.memory.totalBytes)) (\(formatPercent(snapshot.telemetry.memory.usedRatio)))"),
-                MenuInfoLine(title: "Memoria de apps", value: formatBytes(snapshot.telemetry.memory.appBytes)),
-                MenuInfoLine(title: "Memoria cableada", value: formatBytes(snapshot.telemetry.memory.wiredBytes)),
-                MenuInfoLine(title: "Comprimida", value: formatBytes(snapshot.telemetry.memory.compressedBytes)),
-                MenuInfoLine(title: "Archivos en cache", value: formatBytes(snapshot.telemetry.memory.cachedFilesBytes)),
-                MenuInfoLine(title: "Temperatura memoria", value: snapshot.memoryTemperature.map(formatTemperature) ?? "sin datos"),
+                MenuInfoLine(title: "Memoria usada", value: "\(menuFormatBytes(snapshot.telemetry.memory.usedBytes)) / \(menuFormatBytes(snapshot.telemetry.memory.totalBytes)) (\(menuFormatPercent(snapshot.telemetry.memory.usedRatio)))"),
+                MenuInfoLine(title: "Memoria de apps", value: menuFormatBytes(snapshot.telemetry.memory.appBytes)),
+                MenuInfoLine(title: "Memoria cableada", value: menuFormatBytes(snapshot.telemetry.memory.wiredBytes)),
+                MenuInfoLine(title: "Comprimida", value: menuFormatBytes(snapshot.telemetry.memory.compressedBytes)),
+                MenuInfoLine(title: "Archivos en cache", value: menuFormatBytes(snapshot.telemetry.memory.cachedFilesBytes)),
+                MenuInfoLine(title: "Temperatura memoria", value: snapshot.memoryTemperature.map(menuFormatTemperature) ?? "sin datos"),
                 MenuInfoLine(title: "Presión", value: snapshot.telemetry.memory.pressureDescription)
             ]
         case .network:
             return [
-                MenuInfoLine(title: "Bajada", value: snapshot.networkDownBps.map(formatRate) ?? "calculando"),
-                MenuInfoLine(title: "Subida", value: snapshot.networkUpBps.map(formatRate) ?? "calculando"),
+                MenuInfoLine(title: "Bajada", value: snapshot.networkDownBps.map(menuFormatRate) ?? "calculando"),
+                MenuInfoLine(title: "Subida", value: snapshot.networkUpBps.map(menuFormatRate) ?? "calculando"),
                 MenuInfoLine(title: "Interfaces activas", value: snapshot.telemetry.network.interfaces.map(\.displayName).prefix(4).joined(separator: ", "))
             ]
         case .battery:
@@ -1123,7 +1124,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CleanModeControllerDel
                 lines.append(MenuInfoLine(title: "Salud", value: "\(health)%"))
             }
             if let temperature = battery.temperatureCelsius {
-                lines.append(MenuInfoLine(title: "Temperatura", value: formatTemperature(temperature)))
+                lines.append(MenuInfoLine(title: "Temperatura", value: menuFormatTemperature(temperature)))
             }
             return lines
         }
@@ -1261,7 +1262,7 @@ private func topNetworkProcesses() -> [MenuDemandEntry] {
             .joined(separator: ".")
         entries.append(MenuDemandEntry(
             name: name.isEmpty ? processField : name,
-            detail: "↓ \(formatBytes(received)) · ↑ \(formatBytes(sent))",
+            detail: "↓ \(menuFormatBytes(received)) · ↑ \(menuFormatBytes(sent))",
             sortValue: Double(received + sent)
         ))
     }
@@ -1315,7 +1316,7 @@ private func topGPUClients() -> [MenuDemandEntry] {
     return totals
         .sorted { $0.value > $1.value }
         .map { name, nanoseconds in
-            MenuDemandEntry(name: name, detail: gpuTime(nanoseconds), sortValue: Double(nanoseconds))
+            MenuDemandEntry(name: name, detail: menuGpuTime(nanoseconds), sortValue: Double(nanoseconds))
         }
 }
 
@@ -1347,7 +1348,7 @@ private func allMatches(in text: String, pattern: String) -> [[String]] {
     }
 }
 
-private func gpuTime(_ nanoseconds: UInt64) -> String {
+private func menuGpuTime(_ nanoseconds: UInt64) -> String {
     let seconds = Double(nanoseconds) / 1_000_000_000
     if seconds >= 60 {
         return String(format: "%.1f min GPU", seconds / 60)
@@ -1375,20 +1376,20 @@ struct MenuBarSnapshot {
     var detailLines: [MenuInfoLine] {
         var lines: [MenuInfoLine] = [
             MenuInfoLine(title: "Temperaturas", value: componentTemperatureSummary),
-            MenuInfoLine(title: "Temp max", value: hottestTemperature.map(formatTemperature) ?? "sin datos"),
-            MenuInfoLine(title: "CPU", value: "\(cpuUsage.map(formatPercent) ?? "calculando") (\(telemetry.cpu.coreCount) núcleos)"),
+            MenuInfoLine(title: "Temp max", value: hottestTemperature.map(menuFormatTemperature) ?? "sin datos"),
+            MenuInfoLine(title: "CPU", value: "\(cpuUsage.map(menuFormatPercent) ?? "calculando") (\(telemetry.cpu.coreCount) núcleos)"),
             MenuInfoLine(title: "GPU", value: gpuSummary),
-            MenuInfoLine(title: "RAM", value: "\(formatPercent(telemetry.memory.usedRatio)) usada, presión \(telemetry.memory.pressureDescription)"),
-            MenuInfoLine(title: "Ventiladores", value: "\(averageRPM.map(formatRPM) ?? "sin datos") media"),
-            MenuInfoLine(title: "Red", value: "↓ \(networkDownBps.map(formatRate) ?? "calculando") · ↑ \(networkUpBps.map(formatRate) ?? "calculando")"),
-            MenuInfoLine(title: "Disco I/O", value: "↓ \(diskReadBps.map(formatRate) ?? "calculando") · ↑ \(diskWriteBps.map(formatRate) ?? "calculando")"),
-            MenuInfoLine(title: "Disco", value: "\(formatBytes(telemetry.disk.availableBytes)) libres"),
-            MenuInfoLine(title: "Mantenimiento", value: appResourceSummary(appResources)),
+            MenuInfoLine(title: "RAM", value: "\(menuFormatPercent(telemetry.memory.usedRatio)) usada, presión \(telemetry.memory.pressureDescription)"),
+            MenuInfoLine(title: "Ventiladores", value: "\(averageRPM.map(menuFormatRPM) ?? "sin datos") media"),
+            MenuInfoLine(title: "Red", value: "↓ \(networkDownBps.map(menuFormatRate) ?? "calculando") · ↑ \(networkUpBps.map(menuFormatRate) ?? "calculando")"),
+            MenuInfoLine(title: "Disco I/O", value: "↓ \(diskReadBps.map(menuFormatRate) ?? "calculando") · ↑ \(diskWriteBps.map(menuFormatRate) ?? "calculando")"),
+            MenuInfoLine(title: "Disco", value: "\(menuFormatBytes(telemetry.disk.availableBytes)) libres"),
+            MenuInfoLine(title: "Mantenimiento", value: menuAppResourceSummary(appResources)),
             MenuInfoLine(title: "Estado térmico", value: thermalState)
         ]
 
         if let battery = telemetry.battery {
-            lines.insert(MenuInfoLine(title: "Batería", value: batterySummary(battery)), at: 6)
+            lines.insert(MenuInfoLine(title: "Batería", value: menuBatterySummary(battery)), at: 6)
         }
 
         return lines
@@ -1450,7 +1451,7 @@ struct MenuBarSnapshot {
 
         var parts: [String] = []
         if let usage = gpu.utilizationRatio {
-            parts.append("\(formatPercent(usage)) uso")
+            parts.append("\(menuFormatPercent(usage)) uso")
         }
         if let renderer = gpu.rendererUtilizationPercent {
             parts.append("\(Int(renderer.rounded()))% renderer")
@@ -1459,7 +1460,7 @@ struct MenuBarSnapshot {
             parts.append("\(Int(tiler.rounded()))% tiler")
         }
         if let memory = gpu.inUseMemoryBytes {
-            parts.append("\(formatBytes(memory)) memoria")
+            parts.append("\(menuFormatBytes(memory)) memoria")
         }
 
         let detail = parts.isEmpty ? "sin actividad" : parts.joined(separator: ", ")
@@ -1491,7 +1492,7 @@ struct MenuBarSnapshot {
         )
         let diskReadBps = shared.diskReadBps
         let diskWriteBps = shared.diskWriteBps
-        let cpuUsage = computeCPUUsage(current: telemetry.cpu, previous: previous?.telemetry.cpu)
+        let cpuUsage = menuComputeCPUUsage(current: telemetry.cpu, previous: previous?.telemetry.cpu)
 
         return MenuBarSnapshot(
             date: date,
@@ -1656,7 +1657,7 @@ private final class CompactStatusBarView: NSView {
             case .cpu:
                 drawMetric(
                     label: "CPU",
-                    value: snapshot?.cpuUsage.map(formatPercent) ?? "--",
+                    value: snapshot?.cpuUsage.map(menuFormatPercent) ?? "--",
                     temperature: compactTemperature(snapshot?.cpuTemperature),
                     x: cursor,
                     y: y
@@ -1664,7 +1665,7 @@ private final class CompactStatusBarView: NSView {
             case .gpu:
                 drawMetric(
                     label: "GPU",
-                    value: snapshot?.telemetry.gpu?.utilizationRatio.map(formatPercent) ?? "--",
+                    value: snapshot?.telemetry.gpu?.utilizationRatio.map(menuFormatPercent) ?? "--",
                     temperature: compactTemperature(snapshot?.gpuTemperature),
                     x: cursor,
                     y: y
@@ -1672,7 +1673,7 @@ private final class CompactStatusBarView: NSView {
             case .memory:
                 drawMetric(
                     label: "RAM",
-                    value: snapshot.flatMap { $0.telemetry.memory.isAvailable ? formatPercent($0.telemetry.memory.usedRatio) : nil } ?? "--",
+                    value: snapshot.flatMap { $0.telemetry.memory.isAvailable ? menuFormatPercent($0.telemetry.memory.usedRatio) : nil } ?? "--",
                     temperature: compactTemperature(snapshot?.memoryTemperature),
                     x: cursor,
                     y: y
@@ -1756,7 +1757,7 @@ private final class CompactStatusBarView: NSView {
     }
 }
 
-private func computeCPUUsage(current: CPUSnapshot, previous: CPUSnapshot?) -> Double? {
+private func menuComputeCPUUsage(current: CPUSnapshot, previous: CPUSnapshot?) -> Double? {
     guard let previous,
           current.totalTicks >= previous.totalTicks,
           current.totalActiveTicks >= previous.totalActiveTicks else {
@@ -1794,11 +1795,11 @@ private func thermalStateDescription(_ state: ProcessInfo.ThermalState) -> Strin
     }
 }
 
-private func formatRPM(_ value: Double) -> String {
+private func menuFormatRPM(_ value: Double) -> String {
     "\(Int(value.rounded())) RPM"
 }
 
-private func formatTemperature(_ value: Double) -> String {
+private func menuFormatTemperature(_ value: Double) -> String {
     String(format: "%.1f C", value)
 }
 
@@ -1825,16 +1826,16 @@ private func compactBatteryStatus(_ battery: BatterySnapshot?) -> String {
     return battery.externalConnected ? "AC" : "bat"
 }
 
-private func formatPercent(_ value: Double) -> String {
+private func menuFormatPercent(_ value: Double) -> String {
     "\(Int((value * 100).rounded()))%"
 }
 
-private func formatBytes(_ bytes: UInt64) -> String {
+private func menuFormatBytes(_ bytes: UInt64) -> String {
     ByteCountFormatter.statusBarStorage.string(fromByteCount: Int64(bytes))
 }
 
-private func formatRate(_ bytesPerSecond: Double) -> String {
-    "\(formatRateValue(bytesPerSecond)) \(rateUnit(bytesPerSecond))"
+private func menuFormatRate(_ bytesPerSecond: Double) -> String {
+    "\(menuFormatRateValue(bytesPerSecond)) \(menuRateUnit(bytesPerSecond))"
 }
 
 private func compactNetworkRate(down: Double?, up: Double?) -> String {
@@ -1881,7 +1882,7 @@ private func compactRateValue(_ bytesPerSecond: Double) -> String {
     return "\(Int(bytesPerSecond.rounded()))B"
 }
 
-private func formatRateValue(_ bytesPerSecond: Double) -> String {
+private func menuFormatRateValue(_ bytesPerSecond: Double) -> String {
     if bytesPerSecond >= 1_000_000 {
         return String(format: "%.1f", bytesPerSecond / 1_000_000)
     }
@@ -1891,7 +1892,7 @@ private func formatRateValue(_ bytesPerSecond: Double) -> String {
     return "\(Int(bytesPerSecond.rounded()))"
 }
 
-private func rateUnit(_ bytesPerSecond: Double) -> String {
+private func menuRateUnit(_ bytesPerSecond: Double) -> String {
     if bytesPerSecond >= 1_000_000 {
         return "MB/s"
     }
@@ -1914,7 +1915,7 @@ private func batteryStatusDescription(_ battery: BatterySnapshot) -> String {
     return "en batería"
 }
 
-private func batterySummary(_ battery: BatterySnapshot) -> String {
+private func menuBatterySummary(_ battery: BatterySnapshot) -> String {
     var parts = ["\(battery.percent)%"]
 
     if battery.isCharged {
@@ -1940,9 +1941,9 @@ private func batterySummary(_ battery: BatterySnapshot) -> String {
     return parts.joined(separator: " | ")
 }
 
-private func appResourceSummary(_ resources: AppResourceSnapshot) -> String {
-    let cpu = resources.cpuRatio.map(formatPercent) ?? "calculando"
-    return "CPU \(cpu) | RAM \(formatBytes(resources.residentMemoryBytes))"
+private func menuAppResourceSummary(_ resources: AppResourceSnapshot) -> String {
+    let cpu = resources.cpuRatio.map(menuFormatPercent) ?? "calculando"
+    return "CPU \(cpu) | RAM \(menuFormatBytes(resources.residentMemoryBytes))"
 }
 
 private extension ByteCountFormatter {

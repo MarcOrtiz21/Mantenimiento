@@ -14,6 +14,14 @@ struct AppNetworkUsage: Identifiable, Equatable {
     var totalBytes: UInt64 { totalReceivedBytes + totalSentBytes }
 }
 
+struct AppEnergyUsage: Identifiable, Equatable {
+    let id: String
+    let name: String
+    let appPath: String?
+    let energyImpact: Double
+    let processCount: Int
+}
+
 private extension UInt64 {
     func subtractingClamped(_ other: UInt64) -> UInt64 {
         self >= other ? self - other : 0
@@ -183,11 +191,58 @@ final class ProcessDemandSampler {
         let appPath: String?
     }
 
+    /// Impacto energético (la columna de Monitor de Actividad) agrupado por aplicación.
+    func appEnergyUsage() -> [AppEnergyUsage] {
+        let output = ExternalCommandRunner.capture(
+            executable: "/usr/bin/top",
+            arguments: ["-l", "2", "-s", "1", "-o", "power", "-n", "40", "-stats", "pid,command,power"],
+            timeout: 4
+        )
+        let samples = Self.parseTopPower(output)
+        guard !samples.isEmpty else { return [] }
+
+        appNetworkLock.lock()
+        defer { appNetworkLock.unlock() }
+        var groups: [String: AppEnergyUsage] = [:]
+        for sample in samples where sample.power > 0 && sample.command != "top" {
+            let owner = processOwner(pid: sample.pid, fallbackName: sample.command)
+            let current = groups[owner.id]
+            groups[owner.id] = AppEnergyUsage(
+                id: owner.id,
+                name: owner.name,
+                appPath: owner.appPath,
+                energyImpact: (current?.energyImpact ?? 0) + sample.power,
+                processCount: (current?.processCount ?? 0) + 1
+            )
+        }
+        return groups.values.sorted { $0.energyImpact > $1.energyImpact }
+    }
+
+    /// Usa solo la última muestra de `top`; la primera no tiene intervalo y sale a cero.
+    static func parseTopPower(_ output: String) -> [(pid: Int32, command: String, power: Double)] {
+        let lines = output.split(separator: "\n", omittingEmptySubsequences: false)
+        guard let header = lines.lastIndex(where: { $0.hasPrefix("PID") && $0.contains("POWER") }) else { return [] }
+        return lines[(header + 1)...].compactMap { line in
+            let fields = line.split(separator: " ", omittingEmptySubsequences: true)
+            guard fields.count >= 3,
+                  let pid = Int32(fields[0]),
+                  let power = Double(fields[fields.count - 1]) else {
+                return nil
+            }
+            let command = fields[1..<(fields.count - 1)].joined(separator: " ")
+            return (pid, command, power)
+        }
+    }
+
     private func processOwner(forNettopKey key: String) -> ProcessOwner {
         let fallbackName = processDisplayName(key)
         guard let pid = Self.pid(fromNettopKey: key) else {
             return ProcessOwner(id: fallbackName, name: fallbackName, appPath: nil)
         }
+        return processOwner(pid: pid, fallbackName: fallbackName)
+    }
+
+    private func processOwner(pid: Int32, fallbackName: String) -> ProcessOwner {
         if let cached = ownerCache[pid] {
             return cached
         }

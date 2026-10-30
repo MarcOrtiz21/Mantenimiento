@@ -51,6 +51,18 @@ struct MaintenanceFeatureTests {
         #expect(TelemetryChartSeries.history(rows, column: "cpu_percent", range: .live).points.isEmpty)
     }
 
+    @Test func chartDomainIsValidForNegativeConstantAndInvalidValues() {
+        let samples: [[Double]] = [[], [-12.5, -8, -3], [-4, 6], [0, 0], [42, 42], [.nan, .infinity], [-0.2]]
+        for values in samples {
+            let domain = SparklineChartView.domain(for: values)
+            #expect(domain.lowerBound < domain.upperBound)
+            for value in values where value.isFinite {
+                #expect(domain.contains(value))
+            }
+        }
+        #expect(SparklineChartView.domain(for: [10, 20]).lowerBound >= 0)
+    }
+
     @Test func runawayDetectorWaitsForSustainedUsage() {
         AppPreferences.registerDefaults()
         let detector = RunawayProcessDetector()
