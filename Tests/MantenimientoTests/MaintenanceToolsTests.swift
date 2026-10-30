@@ -124,6 +124,7 @@ struct MaintenanceToolsTests {
         #expect(ports.map(\.role) == [.poweringDevice, .charger, .idle])
         #expect(ports[0].deviceBatteryPercent == 90)
         #expect(ports[0].deviceVendorID == 1452)
+        #expect(ports[0].deviceFullCapacity == nil)
         #expect(ports[1].contractVoltageMillivolts == 20_000)
         #expect(ports[1].contractCurrentMilliamps == 4_690)
         #expect(ports[1].offeredVoltagesMillivolts == [5_000, 9_000, 15_000, 20_000])
@@ -134,15 +135,15 @@ struct MaintenanceToolsTests {
     @Test func chargeRateEstimatorUsesObservedPace() {
         let estimator = ChargeRateEstimator()
         let start = Date(timeIntervalSince1970: 1_000)
-        estimator.record(id: "ipad", percent: 90, isCharging: true, at: start)
-        estimator.record(id: "ipad", percent: 91, isCharging: true, at: start.addingTimeInterval(100))
+        estimator.record(id: "ipad", level: 270, full: 300, isCharging: true, at: start)
+        estimator.record(id: "ipad", level: 271, full: 300, isCharging: true, at: start.addingTimeInterval(100))
         #expect(estimator.minutesToFull(id: "ipad") == nil)
 
-        estimator.record(id: "ipad", percent: 92, isCharging: true, at: start.addingTimeInterval(220))
-        estimator.record(id: "ipad", percent: 93, isCharging: true, at: start.addingTimeInterval(340))
-        #expect(estimator.minutesToFull(id: "ipad") == 14)
+        estimator.record(id: "ipad", level: 272, full: 300, isCharging: true, at: start.addingTimeInterval(220))
+        estimator.record(id: "ipad", level: 273, full: 300, isCharging: true, at: start.addingTimeInterval(340))
+        #expect(estimator.minutesToFull(id: "ipad") == 54)
 
-        estimator.record(id: "ipad", percent: 93, isCharging: false, at: start.addingTimeInterval(400))
+        estimator.record(id: "ipad", level: 273, full: 300, isCharging: false, at: start.addingTimeInterval(400))
         #expect(estimator.minutesToFull(id: "ipad") == nil)
     }
 

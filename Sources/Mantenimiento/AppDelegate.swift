@@ -836,13 +836,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CleanModeControllerDel
     private func recordChargeRates(_ battery: BatterySnapshot?) {
         guard let battery else { return }
         let estimator = ChargeRateEstimator.shared
-        estimator.record(id: ChargeRateEstimator.macID, percent: battery.percent, isCharging: battery.isCharging)
+        if let current = battery.currentCapacityMah, let full = battery.fullChargeCapacityMah {
+            estimator.record(id: ChargeRateEstimator.macID, level: current, full: full, isCharging: battery.isCharging)
+        } else {
+            estimator.record(id: ChargeRateEstimator.macID, level: battery.percent, full: 100, isCharging: battery.isCharging)
+        }
         var active: Set<String> = [ChargeRateEstimator.macID]
         for port in battery.ports where port.role == .poweringDevice {
             guard let percent = port.deviceBatteryPercent else { continue }
             let id = ChargeRateEstimator.portID(port.index)
             active.insert(id)
-            estimator.record(id: id, percent: percent, isCharging: true)
+            if let remaining = port.deviceRemainingCapacity, let full = port.deviceFullCapacity {
+                estimator.record(id: id, level: remaining, full: full, isCharging: percent < 100)
+            } else {
+                estimator.record(id: id, level: percent, full: 100, isCharging: percent < 100)
+            }
         }
         estimator.forget(idsNotIn: active)
     }

@@ -243,6 +243,8 @@ public struct USBCPortSnapshot: Codable, Identifiable, Equatable {
     public let offeredVoltagesMillivolts: [Int]
     public let deviceVendorID: Int?
     public let deviceBatteryPercent: Int?
+    public var deviceRemainingCapacity: Int?
+    public var deviceFullCapacity: Int?
 
     public var contractWatts: Double? {
         guard let contractVoltageMillivolts, let contractCurrentMilliamps else { return nil }
@@ -774,9 +776,10 @@ public enum SystemTelemetryService {
             } else {
                 role = .idle
             }
-            let hasBattery = (intValue(device["FedDesignCapacity"]) ?? 0) > 0
+            let designCapacity = intValue(device["FedDesignCapacity"]) ?? 0
+            let hasBattery = designCapacity > 0
 
-            return USBCPortSnapshot(
+            var snapshot = USBCPortSnapshot(
                 index: index,
                 role: role,
                 contractVoltageMillivolts: voltage,
@@ -786,6 +789,11 @@ public enum SystemTelemetryService {
                 deviceVendorID: intValue(device["FedVendorID"]).flatMap { $0 > 0 ? $0 : nil },
                 deviceBatteryPercent: role == .poweringDevice && hasBattery ? intValue(device["FedStateOfCharge"]) : nil
             )
+            if snapshot.deviceBatteryPercent != nil, let remaining = intValue(device["FedRemainingCapacity"]), remaining > 0 {
+                snapshot.deviceRemainingCapacity = remaining
+                snapshot.deviceFullCapacity = designCapacity
+            }
+            return snapshot
         }
     }
 

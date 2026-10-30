@@ -7,13 +7,19 @@
     <img src="https://img.shields.io/badge/macOS-13%2B-111111?logo=apple&logoColor=white" alt="macOS 13+">
     <img src="https://img.shields.io/badge/Swift-5.9%2B-F05138?logo=swift&logoColor=white" alt="Swift 5.9+">
     <img src="https://img.shields.io/badge/Arquitectura-Apple%20Silicon%20%2B%20Intel-0A84FF" alt="Apple Silicon e Intel">
-    <img src="https://img.shields.io/badge/Estado-en%20desarrollo-orange" alt="En desarrollo">
+    <img src="https://img.shields.io/badge/Versi%C3%B3n-1.0.0-34C759" alt="Versión 1.0.0">
   </p>
 </div>
 
 Mantenimiento es una utilidad nativa de macOS para consultar el estado del equipo, revisar sensores y ventiladores, controlar temporalmente la refrigeracion y bloquear la entrada durante la limpieza externa del MacBook.
 
 El proyecto combina una ventana de diagnostico completa con un indicador compacto en la barra de menus. La aplicacion prioriza lecturas fiables, actualizaciones suaves y guardarrailes para devolver los ventiladores a automatico cuando dejan de estar bajo control seguro.
+
+## Descarga
+
+La versión actual es la **1.0.0**. El paquete `Mantenimiento-1.0.0.zip` está en [Releases](https://github.com/MarcOrtiz21/Mantenimiento/releases). Descomprímelo y mueve `Mantenimiento.app` a Aplicaciones.
+
+La app no está notarizada: la primera vez ábrela con clic derecho > **Abrir**, o elimina la cuarentena con `xattr -dr com.apple.quarantine /Applications/Mantenimiento.app`.
 
 ## Funcionalidades
 
@@ -35,7 +41,7 @@ El proyecto combina una ventana de diagnostico completa con un indicador compact
 - Salud de la batería a largo plazo: una medición diaria de la capacidad real para ver su evolución y la pérdida cada 100 ciclos.
 - Batería: capacidad real y de diseño en mAh, ciclos sobre los de diseño, condición, voltaje, amperaje, potencia de carga o descarga, tiempo restante, carga en pausa y datos del cargador.
 - Flujo de energía: potencia de entrada del cargador frente al consumo del sistema.
-- Puertos USB-C: contrato USB Power Delivery del cargador (voltaje, corriente, vatios y voltajes que ofrece) y dispositivos a los que el Mac da corriente (iPad, iPhone…) con su batería y la potencia reservada. Las conexiones y desconexiones quedan en Actividad. El tiempo hasta la carga completa se estima con el ritmo real al que sube el porcentaje (también para el Mac cuando macOS no da el suyo).
+- Puertos USB-C: contrato USB Power Delivery del cargador (voltaje, corriente, vatios y voltajes que ofrece) y dispositivos a los que el Mac da corriente (iPad, iPhone…) con su batería y la potencia reservada. Las conexiones y desconexiones quedan en Actividad. El tiempo hasta la carga completa se estima con el ritmo real al que sube la capacidad restante (en el iPad, en pasos de un tercio de punto; en el Mac, en mAh cuando macOS no da su propio tiempo). Aparece tras observar dos subidas, por lo que con cargas lentas tarda unos minutos.
 - Cargador: firmware, versión de hardware, número de serie y modelo (el firmware del cargador de Apple se actualiza solo desde macOS al conectarlo).
 - Si el gas gauge no publica la temperatura o la condición de la batería, se usan el sensor SMC de la batería y Información del Sistema. Apple Silicon no expone el voltaje ni la corriente reales de cada puerto; para eso hace falta un medidor USB-C físico.
 - Icono de batería en la barra lateral que refleja el nivel y muestra el rayo al cargar.
@@ -214,7 +220,7 @@ Las pruebas de telemetría utilizan Swift Testing y requieren Swift 6 o posterio
 bash Scripts/test.sh
 ```
 
-Cubren reutilización y caducidad de muestras, fallo y recuperación de sensores, rollback de Turbo, timeout de control manual, errores de Auto, límites de RPM, lectura inválida, concesión de supervisión, formato de peticiones, tasas de disco, tramos de gráficas, exportación del historial, límites de altura del desplegable, catálogo de sensores por chip, lectura y agregación del historial, amperaje de la batería y detección de procesos con CPU sostenida.
+Cubren reutilización y caducidad de muestras, fallo y recuperación de sensores, rollback de Turbo, timeout de control manual, errores de Auto, límites de RPM, lectura inválida, concesión de supervisión, formato de peticiones, tasas de disco, tramos de gráficas, exportación del historial, límites de altura del desplegable, catálogo de sensores por chip, lectura y agregación del historial, amperaje de la batería, detección de procesos con CPU sostenida, análisis de espacio, elementos de arranque, registro de salud de la batería, decodificación USB Power Delivery de los puertos, estimación del tiempo de carga, firmware del cargador y dominio de las gráficas.
 
 La retención del historial se comprueba durante la ejecución y al exportar, no solo al iniciar. La demanda de red del menú está limitada a TCP; el tráfico por aplicación del panel incluye TCP y UDP. Las estimaciones de GPU se identifican como tales.
 
@@ -286,7 +292,7 @@ Las lecturas dependen de lo que el hardware y la version de macOS expongan publi
 
 ## Estado del proyecto
 
-Proyecto personal en desarrollo activo. Las operaciones de lectura estan pensadas para ser seguras y no invasivas; las operaciones de escritura SMC permanecen protegidas por limites, autorizacion y restauracion a automatico.
+Versión 1.0.0, primera versión estable. Proyecto personal en desarrollo activo. Las operaciones de lectura estan pensadas para ser seguras y no invasivas; las operaciones de escritura SMC permanecen protegidas por limites, autorizacion y restauracion a automatico.
 
 ## Licencia
 
