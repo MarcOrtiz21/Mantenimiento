@@ -220,6 +220,10 @@ public struct PowerAdapterSnapshot: Codable {
     public let currentMilliamps: Int?
     public let manufacturer: String?
     public let isWireless: Bool
+    public var firmwareVersion: String?
+    public var hardwareVersion: String?
+    public var serialNumber: String?
+    public var model: String?
 }
 
 /// Estado de un puerto USB-C según el controlador de puertos; el índice sigue el orden de AppleSmartBattery.
@@ -825,7 +829,10 @@ public enum SystemTelemetryService {
             ?? (details["Description"] as? String).flatMap { $0.isEmpty ? nil : $0 }
         let watts = positiveInt(details["Watts"])
         guard name != nil || watts != nil else { return nil }
-        return PowerAdapterSnapshot(
+        let text: (String) -> String? = { key in
+            (details[key] as? String).map { $0.trimmingCharacters(in: .whitespaces) }.flatMap { $0.isEmpty ? nil : $0 }
+        }
+        var adapter = PowerAdapterSnapshot(
             name: name,
             watts: watts,
             voltageMillivolts: positiveInt(details["AdapterVoltage"]),
@@ -833,6 +840,17 @@ public enum SystemTelemetryService {
             manufacturer: details["Manufacturer"] as? String,
             isWireless: boolValue(details["IsWireless"])
         )
+        adapter.firmwareVersion = text("FwVersion").map(adapterFirmwareVersion)
+        adapter.hardwareVersion = text("HwVersion")
+        adapter.serialNumber = text("SerialString")
+        adapter.model = text("Model")
+        return adapter
+    }
+
+    /// Información del Sistema muestra el firmware sin los ceros iniciales ("01090058" → "1090058").
+    public static func adapterFirmwareVersion(_ raw: String) -> String {
+        let trimmed = raw.drop { $0 == "0" }
+        return trimmed.isEmpty ? raw : String(trimmed)
     }
 
     /// Condición que muestra Información del Sistema ("Normal", "Servicio recomendado"...).
@@ -842,14 +860,71 @@ public enum SystemTelemetryService {
             return nil
         }
         for source in sources {
-            guard let description = IOPSGetPowerSourceDescription(info, source)?.takeUnretainedValue() as? [String: Any],
+            guard let description = IOPSGetPowerSourceDescription(info, source)?.takeUnretainedValue() as NSDictionary? as? [String: Any],
                   description[kIOPSTypeKey] as? String == kIOPSInternalBatteryType else {
                 continue
             }
             if let condition = description["BatteryHealthCondition"] as? String, !condition.isEmpty {
                 return condition
             }
-            return description[kIOPSBatteryHealthKey] as? String
+            if let health = description[kIOPSBatteryHealthKey] as? String, !health.isEmpty {
+                return health
+            }
+        }
+        return profilerBatteryCondition()
+    }
+
+    private static let profilerConditionLock = NSLock()
+    private static var profilerConditionCache: (date: Date, value: String?)?
+
+    /// Tras algunos arranques IOKit no publica la condición; Información del Sistema sí la conoce.
+    private static func profilerBatteryCondition() -> String? {
+        profilerConditionLock.lock()
+        if let cache = profilerConditionCache, Date().timeIntervalSince(cache.date) < 600 {
+            profilerConditionLock.unlock()
+            return cache.value
+        }
+        profilerConditionLock.unlock()
+
+        let value = profilerPowerJSON().flatMap { parseProfilerBatteryCondition($0) }
+        profilerConditionLock.lock()
+        profilerConditionCache = (Date(), value)
+        profilerConditionLock.unlock()
+        return value
+    }
+
+    private static func profilerPowerJSON() -> String? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/sbin/system_profiler")
+        process.arguments = ["SPPowerDataType", "-json"]
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+        } catch {
+            return nil
+        }
+        let deadline = DispatchTime.now() + .seconds(5)
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: deadline) { [weak process] in
+            if process?.isRunning == true { process?.terminate() }
+        }
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        return process.terminationStatus == 0 ? String(data: data, encoding: .utf8) : nil
+    }
+
+    public static func parseProfilerBatteryCondition(_ json: String) -> String? {
+        guard let data = json.data(using: .utf8),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let entries = root["SPPowerDataType"] as? [[String: Any]] else {
+            return nil
+        }
+        for entry in entries {
+            if let health = entry["sppower_battery_health_info"] as? [String: Any],
+               let condition = health["sppower_battery_health"] as? String, !condition.isEmpty {
+                return condition
+            }
         }
         return nil
     }

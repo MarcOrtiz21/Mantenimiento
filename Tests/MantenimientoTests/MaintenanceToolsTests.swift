@@ -131,6 +131,29 @@ struct MaintenanceToolsTests {
         #expect(ports[2].deviceBatteryPercent == nil)
     }
 
+    @Test func chargeRateEstimatorUsesObservedPace() {
+        let estimator = ChargeRateEstimator()
+        let start = Date(timeIntervalSince1970: 1_000)
+        estimator.record(id: "ipad", percent: 90, isCharging: true, at: start)
+        estimator.record(id: "ipad", percent: 91, isCharging: true, at: start.addingTimeInterval(100))
+        #expect(estimator.minutesToFull(id: "ipad") == nil)
+
+        estimator.record(id: "ipad", percent: 92, isCharging: true, at: start.addingTimeInterval(220))
+        estimator.record(id: "ipad", percent: 93, isCharging: true, at: start.addingTimeInterval(340))
+        #expect(estimator.minutesToFull(id: "ipad") == 14)
+
+        estimator.record(id: "ipad", percent: 93, isCharging: false, at: start.addingTimeInterval(400))
+        #expect(estimator.minutesToFull(id: "ipad") == nil)
+    }
+
+    @Test func adapterFirmwareAndProfilerConditionParse() {
+        #expect(SystemTelemetryService.adapterFirmwareVersion("01090058") == "1090058")
+        #expect(SystemTelemetryService.adapterFirmwareVersion("0") == "0")
+        let json = #"{"SPPowerDataType":[{"sppower_battery_health_info":{"sppower_battery_cycle_count":55,"sppower_battery_health":"Good"}}]}"#
+        #expect(SystemTelemetryService.parseProfilerBatteryCondition(json) == "Good")
+        #expect(SystemTelemetryService.parseProfilerBatteryCondition("{}") == nil)
+    }
+
     @Test func batteryHealthLogStoresOneRowPerDay() throws {
         let folder = try temporaryDirectory()
         defer { try? FileManager.default.removeItem(at: folder) }

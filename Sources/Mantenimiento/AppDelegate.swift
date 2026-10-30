@@ -806,6 +806,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CleanModeControllerDel
         recordPowerTransitions(from: latestMenuBarSnapshot?.telemetry.battery, to: snapshot.telemetry.battery)
         BatteryHealthLog.shared.recordIfNeeded(snapshot.telemetry.battery)
         recordUSBDeviceChanges(snapshot.telemetry)
+        recordChargeRates(snapshot.telemetry.battery)
         previousMenuBarSnapshot = snapshot
         latestMenuBarSnapshot = snapshot
         MaintenanceAlertMonitor.shared.process(snapshot: snapshot)
@@ -830,6 +831,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CleanModeControllerDel
         } else if !previous.isCharged && current.isCharged && current.externalConnected {
             EventLog.shared.record(.power, title: "Carga completa", detail: "Batería al \(current.percent)%")
         }
+    }
+
+    private func recordChargeRates(_ battery: BatterySnapshot?) {
+        guard let battery else { return }
+        let estimator = ChargeRateEstimator.shared
+        estimator.record(id: ChargeRateEstimator.macID, percent: battery.percent, isCharging: battery.isCharging)
+        var active: Set<String> = [ChargeRateEstimator.macID]
+        for port in battery.ports where port.role == .poweringDevice {
+            guard let percent = port.deviceBatteryPercent else { continue }
+            let id = ChargeRateEstimator.portID(port.index)
+            active.insert(id)
+            estimator.record(id: id, percent: percent, isCharging: true)
+        }
+        estimator.forget(idsNotIn: active)
     }
 
     /// Las muestras ligeras reutilizan la lista anterior; solo las completas (con volúmenes) sirven de referencia.

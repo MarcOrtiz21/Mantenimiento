@@ -105,9 +105,9 @@ extension DiagnosticsRootView {
                 )
                 MetricView(
                     title: "Temperatura",
-                    value: battery.temperatureCelsius.map { String(format: "%.1f C", $0) } ?? "sin datos",
+                    value: batteryTemperature(battery).map { String(format: "%.1f °C", $0) } ?? "sin datos",
                     symbol: "thermometer.medium",
-                    tint: (battery.temperatureCelsius ?? 0) >= 40 ? .orange : .secondary
+                    tint: (batteryTemperature(battery) ?? 0) >= 40 ? .orange : .secondary
                 )
                 MetricView(
                     title: "Voltaje",
@@ -187,6 +187,15 @@ extension DiagnosticsRootView {
                     if let manufacturer = adapter.manufacturer {
                         InfoRow(title: "Fabricante", value: adapter.isWireless ? "\(manufacturer) (inalámbrico)" : manufacturer)
                     }
+                    if let firmware = adapter.firmwareVersion {
+                        InfoRow(
+                            title: "Firmware",
+                            value: [firmware, adapter.hardwareVersion.map { "hardware \($0)" }].compactMap { $0 }.joined(separator: " · ")
+                        )
+                    }
+                    if let serial = adapter.serialNumber {
+                        InfoRow(title: "Número de serie", value: [serial, adapter.model.map { "modelo \($0)" }].compactMap { $0 }.joined(separator: " · "))
+                    }
                 }
                 if let input = battery.systemPowerInWatts, let watts = adapter.watts, watts > 0, input >= Double(watts) * 0.9 {
                     Text("El cargador va al límite: si el consumo sube, la batería dejará de cargar o se descargará.")
@@ -199,12 +208,24 @@ extension DiagnosticsRootView {
         }
     }
 
+    /// Si el gas gauge no publica la temperatura se usan los sensores SMC de la batería (TB0T, TB1T…).
+    func batteryTemperature(_ battery: BatterySnapshot) -> Double? {
+        if let celsius = battery.temperatureCelsius { return celsius }
+        let readings = snapshot.sensors?.readings(type: .temperature)
+            .filter { $0.sensor.key.hasPrefix("TB") && $0.value > 0 && $0.value < 100 } ?? []
+        return readings.map { Double($0.value) }.max()
+    }
+
     func batteryHeadline(_ battery: BatterySnapshot) -> String {
         if battery.isCharged || (battery.externalConnected && battery.percent >= 100) {
             return "Cargada y conectada"
         }
         if battery.isCharging {
-            return battery.timeToFullMinutes.map { "Cargando · llena en \(formatBatteryMinutes($0))" } ?? "Cargando"
+            if let minutes = battery.timeToFullMinutes {
+                return "Cargando · llena en \(formatBatteryMinutes(minutes))"
+            }
+            return ChargeRateEstimator.shared.minutesToFull(id: ChargeRateEstimator.macID)
+                .map { "Cargando · llena en ≈ \(formatBatteryMinutes($0))" } ?? "Cargando"
         }
         if battery.externalConnected {
             return "Conectada, carga en pausa"

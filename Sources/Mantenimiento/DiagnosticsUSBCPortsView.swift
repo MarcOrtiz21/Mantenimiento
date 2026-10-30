@@ -11,6 +11,7 @@ struct USBCPortsView: View {
         let name: String
         let allocatedWatts: Double?
         let batteryPercent: Int?
+        var minutesToFull: Int? = nil
     }
 
     private var chargers: [USBCPortSnapshot] { ports.filter { $0.role == .charger } }
@@ -26,7 +27,8 @@ struct USBCPortsView: View {
                 id: "port-\(port.index)",
                 name: device?.name ?? "Dispositivo en el puerto \(port.index + 1)",
                 allocatedWatts: device?.allocatedWatts,
-                batteryPercent: port.deviceBatteryPercent
+                batteryPercent: port.deviceBatteryPercent,
+                minutesToFull: ChargeRateEstimator.shared.minutesToFull(id: ChargeRateEstimator.portID(port.index))
             ))
         }
         for device in remaining where device.allocatedMilliamps >= 500 {
@@ -89,7 +91,7 @@ struct USBCPortsView: View {
             VStack(alignment: .leading, spacing: 1) {
                 Text(row.name)
                     .font(.callout.weight(.medium))
-                Text("El Mac le da corriente")
+                Text(poweredCaption(row))
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -109,6 +111,12 @@ struct USBCPortsView: View {
         .padding(.vertical, 7)
         .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
         .help("Potencia reservada por el Mac a 5 V; el consumo real por puerto no está disponible")
+    }
+
+    private func poweredCaption(_ row: PoweredRow) -> String {
+        guard let percent = row.batteryPercent else { return "Recibe corriente del Mac" }
+        if percent >= 100 { return "Cargado" }
+        return row.minutesToFull.map { "Cargando · lleno en ≈ \(formatBatteryMinutes($0))" } ?? "Cargando · calculando tiempo"
     }
 
     private func offeredDescription(_ port: USBCPortSnapshot) -> String {
