@@ -39,7 +39,7 @@ struct MetricView: View {
         .frame(minHeight: 50)
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .panelSurface()
     }
 }
 
@@ -81,7 +81,7 @@ struct BatteryMetricView: View {
         .frame(minHeight: 50)
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .panelSurface()
         .contentShape(Rectangle())
         .help("Abrir Energía")
     }
@@ -180,7 +180,7 @@ struct EventTimelineView: View {
                         }
                         .padding(.vertical, 6)
                         .padding(.horizontal, 10)
-                        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                        .panelTile()
                     }
                 }
             }
@@ -233,7 +233,7 @@ struct NetworkMetricView: View {
         .frame(minHeight: 50)
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+        .panelSurface()
     }
 
     private func rateRow(symbol: String, rate: Double?, color: Color) -> some View {
@@ -301,7 +301,7 @@ struct SectionPanel<Content: View>: View {
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .panelSurface()
     }
 }
 
@@ -392,7 +392,7 @@ struct SparklineChartView: View {
             }
         }
         .padding(10)
-        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .panelTile()
     }
 }
 
@@ -457,7 +457,7 @@ struct CPUCoreUsageGridView: View {
                         .animation(.easeInOut(duration: 0.55), value: core.usage)
                 }
                 .padding(10)
-                .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .panelTile()
             }
         }
     }
@@ -553,7 +553,7 @@ struct NetworkInterfaceDetailList: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 .padding(10)
-                .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .panelTile()
     }
 
     private func detailLine(_ interface: NetworkInterfaceSnapshot) -> String {
@@ -659,7 +659,7 @@ struct AppNetworkUsageList: View {
         .font(.system(.callout, design: .rounded).monospacedDigit())
         .padding(.horizontal, 10)
         .padding(.vertical, 7)
-        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .panelTile()
         .help(entry.appPath ?? entry.name)
     }
 
@@ -743,7 +743,7 @@ struct VolumeRowView: View {
             VolumeUsageBar(volume: volume)
         }
         .padding(10)
-        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .panelTile()
     }
 
     private var subtitle: String {
@@ -816,7 +816,7 @@ struct GPUDemandListView: View {
                             .foregroundStyle(.secondary)
                     }
                     .padding(10)
-                    .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    .panelTile()
                 }
             }
         }
@@ -877,7 +877,7 @@ struct GlobalFanControlView: View {
             .disabled(isWorking)
         }
         .padding(12)
-        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .panelTile()
     }
 }
 
@@ -963,7 +963,7 @@ struct FanRowView: View {
                 .foregroundStyle(.secondary)
         }
         .padding(12)
-        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .panelTile()
     }
 }
 

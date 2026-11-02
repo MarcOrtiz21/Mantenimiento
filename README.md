@@ -7,7 +7,7 @@
     <img src="https://img.shields.io/badge/macOS-13%2B-111111?logo=apple&logoColor=white" alt="macOS 13+">
     <img src="https://img.shields.io/badge/Swift-5.9%2B-F05138?logo=swift&logoColor=white" alt="Swift 5.9+">
     <img src="https://img.shields.io/badge/Arquitectura-Apple%20Silicon%20%2B%20Intel-0A84FF" alt="Apple Silicon e Intel">
-    <img src="https://img.shields.io/badge/Versi%C3%B3n-1.0.0-34C759" alt="Versión 1.0.0">
+    <img src="https://img.shields.io/badge/Versi%C3%B3n-1.1.0-34C759" alt="Versión 1.1.0">
   </p>
 </div>
 
@@ -17,7 +17,7 @@ El proyecto combina una ventana de diagnostico completa con un indicador compact
 
 ## Descarga
 
-La versión actual es la **1.0.0**. El paquete `Mantenimiento-1.0.0.zip` está en [Releases](https://github.com/MarcOrtiz21/Mantenimiento/releases). Descomprímelo y mueve `Mantenimiento.app` a Aplicaciones.
+La versión actual es la **1.1.0**. El paquete `Mantenimiento-1.1.0.zip` está en [Releases](https://github.com/MarcOrtiz21/Mantenimiento/releases). Descomprímelo y mueve `Mantenimiento.app` a Aplicaciones.
 
 La app no está notarizada: la primera vez ábrela con clic derecho > **Abrir**, o elimina la cuarentena con `xattr -dr com.apple.quarantine /Applications/Mantenimiento.app`.
 
@@ -81,7 +81,9 @@ La app no está notarizada: la primera vez ábrela con clic derecho > **Abrir**,
 - Ventana redimensionable con barra lateral por areas.
 - Apertura opcional al iniciar sesión desde Preferencias.
 - Conserva el tamaño y la posición de la ventana entre aperturas.
-- Panel de estado rapido con CPU, GPU, RAM, red y temperaturas.
+- Panel de estado rapido con CPU, GPU, RAM, red y temperaturas, cada una con una mini gráfica de los últimos 5 minutos.
+- Tarjeta de energía en el desplegable: batería, estado y tiempo de carga, consumo en vatios y dispositivos USB-C a los que el Mac da corriente.
+- Mayor demanda con el icono de cada app y una barra relativa; acciones agrupadas en refrigeración (perfil, Auto, Turbo) y una fila con Limpieza, Abrir panel, Preferencias y Salir.
 - Indicador configurable en la barra de menus.
 - Desplegables de detalle por metrica y demanda por proceso.
 - Desplegable ajustado al contenido y al espacio disponible de la pantalla; solo requiere desplazamiento cuando no cabe completo.
@@ -92,7 +94,7 @@ La app no está notarizada: la primera vez ábrela con clic derecho > **Abrir**,
 - Gráficas adaptables con aprovechamiento de la última fila y subida/bajada de red en líneas separadas.
 - Puntos de gráfica con identidad estable y tramos separados cuando faltan lecturas; las tasas de disco usan su propio intervalo real.
 - Perfil Silencioso respetado con el panel abierto y menos trabajo de la ventana cuando queda oculta.
-- Colores y materiales inspirados en las convenciones de macOS.
+- Colores y materiales inspirados en las convenciones de macOS; en macOS 26 o posterior, Liquid Glass en el desplegable y en los controles del panel, con versiones anteriores manteniendo los materiales clásicos.
 
 ## Tecnologias
 
@@ -292,7 +294,7 @@ Las lecturas dependen de lo que el hardware y la version de macOS expongan publi
 
 ## Estado del proyecto
 
-Versión 1.0.0, primera versión estable. Proyecto personal en desarrollo activo. Las operaciones de lectura estan pensadas para ser seguras y no invasivas; las operaciones de escritura SMC permanecen protegidas por limites, autorizacion y restauracion a automatico.
+Versión 1.1.0. Proyecto personal en desarrollo activo. Las operaciones de lectura estan pensadas para ser seguras y no invasivas; las operaciones de escritura SMC permanecen protegidas por limites, autorizacion y restauracion a automatico.
 
 ## Licencia
 

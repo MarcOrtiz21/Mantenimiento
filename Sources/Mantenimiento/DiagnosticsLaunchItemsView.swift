@@ -93,7 +93,7 @@ struct LaunchItemsView: View {
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 7)
-        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .panelTile()
         .help(item.isOrphaned ? "El programa \(item.programPath ?? "") ya no existe; probablemente es un resto de una app desinstalada." : item.programPath ?? item.label)
     }
 

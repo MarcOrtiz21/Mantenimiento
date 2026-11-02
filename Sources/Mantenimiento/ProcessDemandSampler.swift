@@ -97,7 +97,8 @@ final class ProcessDemandSampler {
                     MenuDemandEntry(
                         name: processDisplayName(key),
                         detail: "midiendo...",
-                        sortValue: Double(counters.received + counters.sent)
+                        sortValue: Double(counters.received + counters.sent),
+                        appPath: Self.pid(fromNettopKey: key).flatMap(demandAppPath)
                     )
                 }
                 .sorted { $0.sortValue > $1.sortValue }
@@ -119,8 +120,9 @@ final class ProcessDemandSampler {
 
             return MenuDemandEntry(
                 name: processDisplayName(key),
-                detail: "Down \(demandRate(receivedRate)) | Up \(demandRate(sentRate))",
-                sortValue: receivedRate + sentRate
+                detail: "↓ \(demandRate(receivedRate)) · ↑ \(demandRate(sentRate))",
+                sortValue: receivedRate + sentRate,
+                appPath: Self.pid(fromNettopKey: key).flatMap(demandAppPath)
             )
         }
         .sorted { $0.sortValue > $1.sortValue }
@@ -267,6 +269,31 @@ final class ProcessDemandSampler {
         return owner
     }
 
+    private let appPathLock = NSLock()
+    private var appPathCache: [Int32: String?] = [:]
+
+    /// Ruta del `.app` que contiene el ejecutable, para mostrar su icono en el desplegable.
+    private func demandAppPath(pid: Int32) -> String? {
+        appPathLock.lock()
+        defer { appPathLock.unlock() }
+        if let cached = appPathCache[pid] {
+            return cached
+        }
+        var buffer = [CChar](repeating: 0, count: 4 * Int(MAXPATHLEN))
+        var appPath: String?
+        if proc_pidpath(pid, &buffer, UInt32(buffer.count)) > 0 {
+            let path = String(cString: buffer)
+            if let range = path.range(of: ".app/") {
+                appPath = String(path[..<range.lowerBound]) + ".app"
+            }
+        }
+        if appPathCache.count > 2_000 {
+            appPathCache.removeAll()
+        }
+        appPathCache[pid] = appPath
+        return appPath
+    }
+
     private static func pid(fromNettopKey key: String) -> Int32? {
         guard let dot = key.lastIndex(of: ".") else { return nil }
         return Int32(key[key.index(after: dot)...])
@@ -291,7 +318,7 @@ final class ProcessDemandSampler {
         guard let previousGPUDate else {
             return current
                 .map { name, time in
-                    MenuDemandEntry(name: name, detail: "midiendo...", sortValue: Double(time))
+                    MenuDemandEntry(name: Self.gpuDisplayName(name), detail: "midiendo...", sortValue: Double(time), appPath: Self.gpuPID(name).flatMap(demandAppPath))
                 }
                 .sorted { $0.sortValue > $1.sortValue }
         }
@@ -308,12 +335,24 @@ final class ProcessDemandSampler {
 
             let ratio = min(max(Double(delta) / 1_000_000_000 / interval, 0), 1)
             return MenuDemandEntry(
-                name: name,
+                name: Self.gpuDisplayName(name),
                 detail: String(format: "≈ %.1f%% GPU", ratio * 100),
-                sortValue: ratio
+                sortValue: ratio,
+                appPath: Self.gpuPID(name).flatMap(demandAppPath)
             )
         }
         .sorted { $0.sortValue > $1.sortValue }
+    }
+
+    /// Las claves de GPU tienen la forma "nombre (pid)".
+    private static func gpuPID(_ key: String) -> Int32? {
+        guard key.hasSuffix(")"), let open = key.lastIndex(of: "(") else { return nil }
+        return Int32(key[key.index(after: open)..<key.index(before: key.endIndex)])
+    }
+
+    private static func gpuDisplayName(_ key: String) -> String {
+        guard gpuPID(key) != nil, let open = key.lastIndex(of: "(") else { return key }
+        return key[..<open].trimmingCharacters(in: .whitespaces)
     }
 
     private func parseNetworkCounters(_ output: String) -> [String: NetworkCounters] {
@@ -403,7 +442,12 @@ final class ProcessDemandSampler {
                     return nil
                 }
 
-                return MenuDemandEntry(name: name, detail: valueFormatter(value, rss), sortValue: value)
+                return MenuDemandEntry(
+                    name: name,
+                    detail: valueFormatter(value, rss),
+                    sortValue: value,
+                    appPath: Int32(parts[0]).flatMap(demandAppPath)
+                )
             }
     }
 

@@ -79,7 +79,7 @@ struct USBCPortsView: View {
         .font(.system(.callout, design: .rounded).monospacedDigit())
         .padding(.horizontal, 10)
         .padding(.vertical, 7)
-        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .panelTile()
         .help("Contrato USB Power Delivery negociado entre el Mac y el cargador")
     }
 
@@ -109,7 +109,7 @@ struct USBCPortsView: View {
         .font(.system(.callout, design: .rounded).monospacedDigit())
         .padding(.horizontal, 10)
         .padding(.vertical, 7)
-        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .panelTile()
         .help("Potencia reservada por el Mac a 5 V; el consumo real por puerto no está disponible")
     }
 

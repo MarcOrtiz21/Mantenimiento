@@ -248,8 +248,10 @@ struct DiagnosticsRootView: View {
                 refresh()
             } label: {
                 Image(systemName: "arrow.clockwise")
+                    .frame(width: 16, height: 16)
             }
-            .buttonStyle(.bordered)
+            .glassIconButtonStyle()
+            .focusable(false)
             .help("Actualizar")
             .disabled(isWorking || isRefreshing)
         }

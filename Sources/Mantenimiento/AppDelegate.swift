@@ -807,6 +807,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CleanModeControllerDel
         BatteryHealthLog.shared.recordIfNeeded(snapshot.telemetry.battery)
         recordUSBDeviceChanges(snapshot.telemetry)
         recordChargeRates(snapshot.telemetry.battery)
+        MenuBarSparklineHistory.shared.record(snapshot)
         previousMenuBarSnapshot = snapshot
         latestMenuBarSnapshot = snapshot
         MaintenanceAlertMonitor.shared.process(snapshot: snapshot)
@@ -1086,7 +1087,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, CleanModeControllerDel
             return [MenuInfoLine(title: "Procesos", value: "Sin actividad detectada")]
         }
 
-        return entries.map { MenuInfoLine(title: $0.name, value: $0.detail) }
+        let top = entries.map(\.sortValue).max() ?? 0
+        return entries.map { entry in
+            MenuInfoLine(
+                title: entry.name,
+                value: entry.detail,
+                appPath: entry.appPath,
+                fraction: top > 0 ? min(max(entry.sortValue / top, 0), 1) : nil
+            )
+        }
     }
 
     private func loadDemandEntries(for section: MenuBarSection) -> [MenuDemandEntry] {
@@ -1251,21 +1260,26 @@ struct MenuDemandEntry {
     let name: String
     let detail: String
     let sortValue: Double
+    var appPath: String?
 
     var menuTitle: String {
         "\(name): \(detail)"
     }
 
-    init(name: String, detail: String, sortValue: Double = 0) {
+    init(name: String, detail: String, sortValue: Double = 0, appPath: String? = nil) {
         self.name = name
         self.detail = detail
         self.sortValue = sortValue
+        self.appPath = appPath
     }
 }
 
 struct MenuInfoLine {
     let title: String
     let value: String
+    var appPath: String? = nil
+    /// Proporción respecto a la entrada con más demanda, para dibujar la barra.
+    var fraction: Double? = nil
 }
 
 private struct StatusMenuHandles {

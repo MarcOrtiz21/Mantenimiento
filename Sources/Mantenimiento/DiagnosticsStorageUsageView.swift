@@ -104,7 +104,7 @@ struct StorageUsageView: View {
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 7)
-        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .panelTile()
     }
 
     private func largeFileRow(_ file: LargeFile) -> some View {
@@ -136,7 +136,7 @@ struct StorageUsageView: View {
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 6)
-        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .panelTile()
     }
 
     private func infoLine(symbol: String, title: String, detail: String) -> some View {
@@ -155,7 +155,7 @@ struct StorageUsageView: View {
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 7)
-        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .panelTile()
     }
 
     private func sizeText(_ category: StorageCategory) -> String {

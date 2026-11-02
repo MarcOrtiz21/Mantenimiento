@@ -54,7 +54,7 @@ struct AppEnergyUsageList: View {
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 7)
-        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .panelTile()
         .help(entry.appPath ?? entry.name)
     }
 
